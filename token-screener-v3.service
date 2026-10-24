@@ -1,0 +1,23 @@
+[Unit]
+Description=Robinhood Chain token screener v3 (watch-launches.js, Gates 0-6 incl. 5c)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/bot-v3
+# --since 15m: after any restart, re-scan the last 15 minutes so a launch
+# during the restart is not missed. Tokens already in launches.jsonl are
+# never screened twice.
+ExecStart=/usr/bin/node /home/botuser/bot-v3/watch-launches.js --since 15m
+Restart=always
+RestartSec=10
+# The watcher writes its own full log to /home/botuser/bot-v3/logs/ (one file
+# per start), so stdout is not duplicated here. Crashes still land in
+# service-error.log.
+StandardOutput=null
+StandardError=append:/home/botuser/bot-v3/service-error.log
+
+[Install]
+WantedBy=multi-user.target

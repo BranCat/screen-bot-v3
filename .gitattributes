@@ -1,0 +1,3 @@
+# Keep Linux line endings (the bot runs on Ubuntu), also when Git rewrites files on Windows.
+* text=auto eol=lf
+*.sol text eol=lf

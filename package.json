@@ -1,0 +1,13 @@
+{
+  "name": "screen-bot-v3",
+  "version": "3.0.0",
+  "private": true,
+  "description": "Robinhood Chain launch watcher + token screener (Gates 0-6 incl. 5b transfer audit and 5c allowance backdoor). Read-only: never trades, never signs.",
+  "main": "watch-launches.js",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "dotenv": "^17.2.0",
+    "ethers": "5.8.0"
+  }
+}

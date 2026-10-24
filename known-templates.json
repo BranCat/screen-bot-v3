@@ -1,0 +1,13 @@
+{
+  "comment": "Gate 0 template shortcut (template-match.js). A token whose source is not published yet is still accepted at Gate 0 if its runtime bytecode is IDENTICAL (Solidity metadata tail ignored) to the reference token's, and its pool is on the named hook. Each reference must be a token whose source is verified on the explorer. Turn the shortcut off with TEMPLATE_MATCH=0 in .env.",
+  "templates": [
+    {
+      "name": "PonsV2LauncherToken",
+      "reference": "0xFCc86D9c23FfB9f27258534eA316C096F1Af51b9",
+      "referenceSymbol": "HRX",
+      "referenceNote": "verified on Blockscout as PonsV2LauncherToken (fully verified, solc 0.8.35); the bot's first SNIP, 15 Oct 2026",
+      "sizeBytes": 3248,
+      "hook": "pons"
+    }
+  ]
+}

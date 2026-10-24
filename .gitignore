@@ -1,0 +1,18 @@
+# Secrets: never commit
+.env
+.env.*
+
+# Installed packages (reinstalled with npm ci)
+node_modules/
+
+# Data and output produced by the running bot (stays on the server)
+screens/
+logs/
+*.log
+extras/live/
+extras/exports/
+tenderly-last-response.json
+
+# Old hand-made backups: git keeps the history now
+*.before-*.js
+*.before-*.sh
