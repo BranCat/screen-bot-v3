@@ -226,6 +226,110 @@ function pct(part, whole) {
   return BN(part).mul(1000000).div(whole).toNumber() / 10000;
 }
 
+// --------------------------------------------------------------------------
+// 2026-10-24: pinning to the screen's block
+// --------------------------------------------------------------------------
+// Gates 3 to 5b simulate on one fixed block (Gate 3's pinnedBlock), and the
+// victim's sell legs here are sized from Gate 3's buy on that block. Gate 6
+// used to send its bundles with no block number, so they ran on whatever block
+// was newest a minute later. When the price had moved, the victim's buy
+// returned fewer tokens than the sell tried to sell, and the sell reverted: the
+// ORBIX false alarm of 22 Oct ("victim's sell reverted after whale dump"). With
+// opts.pinnedBlock set, every bundle and every RPC read below is "as of" that
+// block. Same approach as extras/gate6-recheck.js, which proved it on ORBIX.
+const NO_HISTORY_RE = /missing trie node|header not found|historical state|state (is )?not available|pruned|unknown block|block not found|state histories/i;
+
+function pinnedProvider(base, block, note = () => {}) {
+  let fellBack = false;
+  const tag = (t) => (t == null ? (fellBack ? 'latest' : block) : t);
+  const guard = async (fn, t) => {
+    try { return await fn(tag(t)); } catch (e) {
+      if (!fellBack && NO_HISTORY_RE.test(String(e.body || e.message || e))) {
+        fellBack = true;
+        note('the RPC has no state for the screen block; RPC reads fell back to the newest block (Tenderly stays pinned)');
+        return fn('latest');
+      }
+      throw e;
+    }
+  };
+  return {
+    getBlockNumber: async () => block,
+    call: (tx, t) => guard((b) => base.call(tx, b), t),
+    getCode: (a, t) => guard((b) => base.getCode(a, b), t),
+    getBalance: (a, t) => guard((b) => base.getBalance(a, b), t),
+    getStorageAt: (a, sl, t) => guard((b) => base.getStorageAt(a, sl, b), t),
+    getLogs: (f) => base.getLogs({ ...f, toBlock: Math.min(Number(f.toBlock ?? block), block) }),
+    getBlock: (b) => base.getBlock(b),
+    getNetwork: () => base.getNetwork(),
+    get _isProvider() { return true; },
+    _pinnedBlock: block,
+  };
+}
+
+const pinSteps = (steps, n) => (n == null ? steps : steps.map((st) => ({ ...st, block_number: n })));
+
+// --------------------------------------------------------------------------
+// 2026-10-24: what actually went wrong in a reverted step
+// --------------------------------------------------------------------------
+// formatStepError() gives Tenderly's one-line message, which for the whale's
+// failed sell was not enough to say WHY it failed. This keeps the decoded
+// revert reason, the deepest failing call, and the gas used against the limit,
+// so an out-of-gas, a sell cap and a refused sender can be told apart.
+const REVERT_IFACE = new ethers.utils.Interface(['function Error(string)', 'function Panic(uint256)']);
+
+function decodeRevert(data) {
+  if (typeof data !== 'string' || !/^0x[0-9a-fA-F]*$/.test(data) || data.length < 10) return null;
+  const sel = data.slice(0, 10).toLowerCase();
+  try {
+    if (sel === '0x08c379a0') return `Error("${REVERT_IFACE.decodeFunctionData('Error', data)[0]}")`;
+    if (sel === '0x4e487b71') return `Panic(0x${REVERT_IFACE.decodeFunctionData('Panic', data)[0].toHexString().slice(2)})`;
+  } catch (_) { /* fall through to the raw selector */ }
+  return `custom error ${sel}${data.length > 10 ? ` (+${(data.length - 10) / 2} bytes)` : ''}`;
+}
+
+function deepestFailingCall(trace, depth = 0) {
+  if (!trace || typeof trace !== 'object' || depth > 40) return null;
+  let best = null;
+  for (const c of Array.isArray(trace.calls) ? trace.calls : []) {
+    const d = deepestFailingCall(c, depth + 1);
+    if (d && (!best || d.depth > best.depth)) best = d;
+  }
+  if (best) return best;
+  const err = trace.error || trace.error_reason || null;
+  if (!err) return null;
+  return {
+    depth,
+    to: trace.to || null,
+    fn: trace.function_name || (typeof trace.input === 'string' ? trace.input.slice(0, 10) : null),
+    error: String(err).slice(0, 200),
+    reason: trace.error_reason ? String(trace.error_reason).slice(0, 200) : decodeRevert(trace.output),
+  };
+}
+
+function stepDiagnosis(result) {
+  if (!result) return { message: 'no result for this step' };
+  const raw = result.raw || {};
+  const txn = raw.transaction || raw.simulation || raw;
+  const info = (txn && txn.transaction_info) || raw.transaction_info || {};
+  const trace = info.call_trace || txn.call_trace || null;
+  const num = (x) => (x == null || x === '' ? null : Number(x));
+  const gasUsed = num(txn.gas_used ?? info.gas_used ?? (trace && trace.gas_used));
+  const gasLimit = num(txn.gas ?? (raw.simulation && raw.simulation.gas));
+  const message = formatStepError(result);
+  const deepest = deepestFailingCall(trace);
+  const revert = decodeRevert(trace && trace.output);
+  const outOfGas = /out of gas|gas limit|intrinsic gas/i.test(`${message} ${deepest ? deepest.error : ''}`) ||
+    (gasUsed != null && gasLimit ? gasUsed >= gasLimit * 0.98 : false);
+  return {
+    message: message ? String(message).slice(0, 300) : null,
+    revertReason: revert,
+    deepest,
+    gasUsed,
+    gasLimit,
+    outOfGas,
+  };
+}
+
 async function getCodeSize(provider, address) {
   const code = await provider.getCode(address);
   return code && code !== '0x' ? (code.length - 2) / 2 : 0;
@@ -572,7 +676,7 @@ async function oneRun({ p, addr, legs, victimBuyWei, victimSellWei, middleSteps 
 
   let results;
   try {
-    results = await simulateBundle(steps);
+    results = await simulateBundle(pinSteps(steps, legs.pin));
   } catch (e) {
     return { internalError: e.message };
   }
@@ -585,6 +689,8 @@ async function oneRun({ p, addr, legs, victimBuyWei, victimSellWei, middleSteps 
     : [];
   const middleReverted = middleResults.some((r) => !r || r.reverted);
   const middleError = middleResults.map((r) => (r && r.reverted ? formatStepError(r) : null)).find(Boolean) || null;
+  const failIdx = middleResults.findIndex((r) => !r || r.reverted);
+  const middleFail = failIdx < 0 ? null : { index: failIdx, ...stepDiagnosis(middleResults[failIdx]) };
 
   const buyResult = results[buy.length - 1];
   const buyReverted = !buyResult || buyResult.reverted;
@@ -599,6 +705,7 @@ async function oneRun({ p, addr, legs, victimBuyWei, victimSellWei, middleSteps 
     buyError: buyReverted ? formatStepError(buyResult) : null,
     middleReverted,
     middleError,
+    middleFail,
     sellReverted,
     sellError: sellReverted ? formatStepError(sellResult) : null,
     proceedsWei: proceeds ? proceeds.toString() : null,
@@ -867,6 +974,40 @@ async function findWhale(p, addr, opts) {
   return { error: 'no eligible holder found in the explorer holders list' };
 }
 
+// How the whale's balance is split when one sale of all of it reverts.
+const WHALE_DUMP_PIECES = [1, 4, 10];
+
+// The whale's sale as bundle steps: the approvals once, then `n` swaps whose
+// sizes add up to exactly `balanceWei` (the last one takes the remainder).
+// `labels` names each step so a revert can be reported as "approval 1" or
+// "swap 3/4" rather than an index.
+function whaleDumpSteps(legs, from, balanceWei, n = 1, codeCleared = false) {
+  const bal = BN(balanceWei);
+  const piece = bal.div(n);
+  const steps = [];
+  const labels = [];
+  for (let k = 1; k <= n; k += 1) {
+    const amt = k === n ? bal.sub(piece.mul(n - 1)) : piece;
+    const s = legs.sellSteps({ from, amountInWei: amt });
+    if (k === 1) {
+      s.slice(0, -1).forEach((st, i) => { steps.push(st); labels.push(`approval ${i + 1}`); });
+    }
+    steps.push(s[s.length - 1]);
+    labels.push(`swap ${k}/${n}`);
+  }
+  if (codeCleared) {
+    const key = lc(from);
+    steps.forEach((st) => {
+      if (lc(st.from) !== key) return;
+      const so = { ...(st.state_objects || {}) };
+      const k2 = Object.keys(so).find((a) => lc(a) === key) || from;
+      so[k2] = { ...(so[k2] || {}), code: '0x' };
+      st.state_objects = so;
+    });
+  }
+  return { steps, labels };
+}
+
 async function whaleDumpProbe(p, addr, opts, baseline, legs) {
   if (!legs) {
     return { verdict: 'UNPROVEN', reason: 'swap legs could not be built for this pool' };
@@ -881,12 +1022,67 @@ async function whaleDumpProbe(p, addr, opts, baseline, legs) {
   const victimBuyWei = BN(opts.baseAmountWei);
   const { sellBps, victimSellWei } = probeSellSize(opts, baseline);
 
-  // The whale sells its entire balance. No state override is needed — this is
-  // the real balance the chain already shows for that address, which is what
-  // makes this probe a statement about the actual pool rather than a fabricated
-  // scenario.
-  const dump = legs.sellSteps({ from: whale.address, amountInWei: whale.balanceWei });
-  const run = await oneRun({ p, addr, legs, victimBuyWei, victimSellWei, sellBps, middleSteps: dump });
+  // 2026-10-24: the whale's balance is read on-chain, on the pinned block when
+  // there is one. The explorer lists today's holders and today's balances, and
+  // a balance larger than what the address held on the simulated block makes
+  // its sell revert for a reason that has nothing to do with the token.
+  let balanceNote = null;
+  if (whale.source === 'explorer' && opts.provider && typeof opts.provider.call === 'function') {
+    try {
+      const raw = await opts.provider.call({ to: p.tokenAddr, data: erc20Iface.encodeFunctionData('balanceOf', [whale.address]) });
+      const onChain = erc20Iface.decodeFunctionResult('balanceOf', raw)[0];
+      if (!onChain.eq(whale.balanceWei)) {
+        balanceNote = `explorer balance ${whale.balanceWei.toString()} differs from the on-chain balance ${onChain.toString()}${legs.pin != null ? ` at block ${legs.pin}` : ''}; the on-chain one was used`;
+        whale.balanceWei = onChain;
+      }
+    } catch (e) {
+      balanceNote = `on-chain balance of the top holder could not be read (${String(e.message || e).slice(0, 120)}); the explorer balance was used`;
+    }
+    if (whale.balanceWei.isZero()) {
+      return { verdict: 'NO_WHALE', whale: whale.address, reason: `the top holder held nothing${legs.pin != null ? ` at block ${legs.pin}` : ''}`, balanceNote };
+    }
+  }
+
+  // The whale sells its real balance (no state override: the chain already
+  // shows it), first in one transaction. 2026-10-24: when that one sale itself
+  // reverts, it is retried in pieces (WHALE_DUMP_PIECES), all inside the same
+  // bundle, because a real whale facing a per-transaction cap would simply sell
+  // in several transactions. Every attempt and its real error are kept in
+  // `attempts`. An approval that fails cannot be fixed by splitting, so the
+  // ladder stops there. For a contract holder whose approval failed, one more
+  // try is made with its code cleared inside the simulation (as if it were a
+  // plain wallet): that can only overstate the dump, never understate it, and
+  // the result says so.
+  const attempts = [];
+  let run = null;
+  let used = null;
+  const tryLadder = async (codeCleared) => {
+    for (const n of WHALE_DUMP_PIECES) {
+      const dump = whaleDumpSteps(legs, whale.address, whale.balanceWei, n, codeCleared);
+      const r = await oneRun({ p, addr, legs, victimBuyWei, victimSellWei, sellBps, middleSteps: dump.steps });
+      const failedStep = r.middleFail ? dump.labels[r.middleFail.index] || `step ${r.middleFail.index + 1}` : null;
+      attempts.push({
+        pieces: n,
+        codeCleared,
+        result: r.internalError ? 'error' : r.indeterminate ? 'indeterminate' : r.middleReverted ? 'whale sell reverted' : 'whale sold',
+        failedStep,
+        ...(r.middleFail ? {
+          error: r.middleFail.message, revertReason: r.middleFail.revertReason, deepest: r.middleFail.deepest,
+          gasUsed: r.middleFail.gasUsed, gasLimit: r.middleFail.gasLimit, outOfGas: r.middleFail.outOfGas,
+        } : {}),
+        ...(r.internalError ? { error: String(r.internalError).slice(0, 300) } : {}),
+      });
+      run = r;
+      used = { pieces: n, codeCleared };
+      if (r.internalError || r.indeterminate || !r.middleReverted) return;
+      if (failedStep && !/^swap/.test(failedStep)) return; // an approval failed; smaller pieces cannot help
+    }
+  };
+  await tryLadder(false);
+  const lastFail = attempts[attempts.length - 1];
+  if (run.middleReverted && whale.isContract && lastFail && lastFail.failedStep && !/^swap/.test(lastFail.failedStep)) {
+    await tryLadder(true);
+  }
 
   const common = {
     whale: whale.address,
@@ -897,22 +1093,36 @@ async function whaleDumpProbe(p, addr, opts, baseline, legs) {
     whaleIsContract: whale.isContract ?? null,
     whaleBalanceWei: whale.balanceWei.toString(),
     baselineRatio: Number(baseline.ratio.toFixed(6)),
+    pinnedBlock: legs.pin ?? null,
+    dumpPieces: used ? used.pieces : null,
+    whaleCodeCleared: used ? used.codeCleared : false,
+    // A single full-balance sale failed but smaller ones went through: most
+    // likely a per-transaction sell limit. Matters only if your own sale is
+    // bigger than the limit; recorded so it can be looked at.
+    sellCapSuspected: Boolean(used && used.pieces > 1 && !run.middleReverted),
+    attempts,
+    ...(balanceNote ? { balanceNote } : {}),
   };
 
   if (run.internalError) return { ...common, verdict: 'ERROR', reason: run.internalError };
   if (run.indeterminate) return { ...common, verdict: 'UNPROVEN', reason: run.reason };
 
   if (run.middleReverted) {
-    // The whale itself could not sell. That is a finding about the token, but
-    // it belongs to the sell-cap gate, not here — and it means this probe did
-    // not get to test what it exists to test.
+    // The whale itself could not sell, in any size tried. That belongs to the
+    // sell-cap question, not here, and it means this probe did not get to test
+    // what it exists to test.
+    const tried = attempts.map((a) => `${a.pieces === 1 ? 'whole balance' : `${a.pieces} pieces`}${a.codeCleared ? ' (code cleared)' : ''}: ${a.failedStep || 'a step'} reverted — ${a.revertReason || a.error || 'no error detail'}${a.outOfGas ? ' [out of gas]' : ''}`).join('; ');
     return {
       ...common,
       verdict: 'UNPROVEN',
-      reason: `the top holder's own sell reverted (${run.middleError}), so the post-dump state was never reached. Worth noting separately: a balance that large may simply exceed a per-transaction sell cap.`,
+      reason: `the top holder's own sell reverted every way it was tried (${tried}), so the post-dump state was never reached.` +
+        (attempts.some((a) => a.pieces > 1 && /^swap/.test(a.failedStep || ''))
+          ? ' Smaller pieces failed too, so this is not simply a per-transaction sell cap.'
+          : ' Worth noting separately: a balance that large may exceed a per-transaction sell cap.'),
     };
   }
 
+  const how = `${used.pieces === 1 ? 'in one sale' : `in ${used.pieces} sales (one sale of the whole balance reverted)`}${used.codeCleared ? ', simulated as a plain wallet' : ''}`;
   const ratio = run.ratio;
   const recoveryFraction = ratio == null ? null : ratio / baseline.ratio;
   const out = {
@@ -922,15 +1132,15 @@ async function whaleDumpProbe(p, addr, opts, baseline, legs) {
   };
 
   if (run.sellReverted) {
-    return { ...out, verdict: 'WHALE_DUMP_FATAL', reason: `after the top holder sold its entire balance, the victim's sell reverted (${run.sellError}) — the same sell succeeded in the undisturbed baseline.` };
+    return { ...out, verdict: 'WHALE_DUMP_FATAL', reason: `after the top holder sold its entire balance ${how}, the victim's sell reverted (${run.sellError}) — the same sell succeeded in the undisturbed baseline.` };
   }
   if (recoveryFraction == null) {
     return { ...out, verdict: 'UNPROVEN', reason: 'the victim sold successfully after the dump, but its proceeds could not be measured, so the severity is unknown.' };
   }
   if (recoveryFraction < FATAL_RECOVERY_FRACTION) {
-    return { ...out, verdict: 'WHALE_DUMP_FATAL', reason: `after the top holder sold its entire balance, the victim recovered ${(recoveryFraction * 100).toFixed(1)}% of the undisturbed proceeds.` };
+    return { ...out, verdict: 'WHALE_DUMP_FATAL', reason: `after the top holder sold its entire balance ${how}, the victim recovered ${(recoveryFraction * 100).toFixed(1)}% of the undisturbed proceeds.` };
   }
-  return { ...out, verdict: 'WHALE_DUMP_SURVIVED', reason: `the top holder sold its entire balance and the victim still recovered ${(recoveryFraction * 100).toFixed(1)}% of the undisturbed proceeds.` };
+  return { ...out, verdict: 'WHALE_DUMP_SURVIVED', reason: `the top holder sold its entire balance ${how} and the victim still recovered ${(recoveryFraction * 100).toFixed(1)}% of the undisturbed proceeds.` };
 }
 
 // --------------------------------------------------------------------------
@@ -956,6 +1166,16 @@ async function rugCheck(p, addr = config.ADDR, opts = {}) {
     };
   }
 
+  // 2026-10-24: pin everything to the block Gates 3 to 5b used (see
+  // pinnedProvider above). Without a pin, behaviour is exactly as before.
+  const pin = opts.pinnedBlock != null && /^\d+$/.test(String(opts.pinnedBlock)) ? Number(opts.pinnedBlock) : null;
+  if (pin != null) {
+    const note = (m) => { if (!notes.includes(m)) notes.push(m); };
+    opts = { ...opts, provider: pinnedProvider(opts.provider, pin, note) };
+  } else {
+    notes.push('not pinned: no pinnedBlock was given, so the simulations ran on the newest block');
+  }
+
   let census;
   try {
     census = await positionCensus(p, { provider: opts.provider, addr, lookbackBlocks: opts.lookbackBlocks });
@@ -976,6 +1196,7 @@ async function rugCheck(p, addr = config.ADDR, opts = {}) {
     notes.push(`could not build swap legs for this pool: ${e.message}`);
   }
   if (legs && legs.note) notes.push(legs.note);
+  if (legs) legs.pin = pin;
   let baseline = null;
   if (legs) {
     baseline = await baselineRun({
@@ -994,6 +1215,7 @@ async function rugCheck(p, addr = config.ADDR, opts = {}) {
   const censusOut = { ...census };
   delete censusOut._top;
   const probes = {
+    pinnedBlock: pin,
     census: censusOut,
     baseline: baseline ? { ok: baseline.ok, ratio: baseline.ratio ?? null, sellBps: baseline.sellBps ?? null, reason: baseline.reason ?? null } : null,
     removal,
@@ -1040,6 +1262,11 @@ module.exports = {
   baselineRun,
   liquidityRemovalProbe,
   whaleDumpProbe,
+  whaleDumpSteps,
+  WHALE_DUMP_PIECES,
+  pinnedProvider,
+  stepDiagnosis,
+  decodeRevert,
   findWhale,
   // The v4 swap encoder, resolved once: the real one from tenderly-bundle-v4.js
   // when it is exported, this module's checked copy otherwise. Other scripts

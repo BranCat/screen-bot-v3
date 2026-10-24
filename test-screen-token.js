@@ -402,6 +402,22 @@ function deps(over = {}) {
     assert.strictEqual(opts.pinnedBlock, 92348719);
     assert.strictEqual(r.audit.pinnedBlock, 92348719);
   });
+  // 2026-10-24: Gate 6 runs on the same block.
+  await check('Gate 6 is given Gate 3\'s pinned block', async () => {
+    let rugOpts = null;
+    const { d } = deps({
+      walletRoundTrip: async () => goodSim({ pinnedBlock: 92348719 }),
+      rugCheck: async (p, a, o) => { rugOpts = o; return { decision: 'PASS', reason: 'ok', probes: {} }; },
+    });
+    await quiet(() => screen(TOKEN, { deps: d }));
+    assert.strictEqual(rugOpts.pinnedBlock, 92348719);
+  });
+  await check('Gate 6 gets no pin when Gate 3 was not pinned', async () => {
+    let rugOpts = null;
+    const { d } = deps({ rugCheck: async (p, a, o) => { rugOpts = o; return { decision: 'PASS', reason: 'ok', probes: {} }; } });
+    await quiet(() => screen(TOKEN, { deps: d }));
+    assert.ok(rugOpts && rugOpts.pinnedBlock == null, String(rugOpts && rugOpts.pinnedBlock));
+  });
   await check('Gate 5b gets no pin (pins itself) when Gate 3 was not pinned', async () => {
     let opts = null;
     const { d } = deps({ transferAudit: async (t, o) => { opts = o; return { ok: true, findings: [], ...FULL_AUDIT }; } });

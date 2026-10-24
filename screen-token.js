@@ -394,8 +394,11 @@ function printRugProbes(rug) {
     const w = rug.probes.whaleDump;
     const rec = w.recoveryFraction == null ? '' : `, victim recovers ${(w.recoveryFraction * 100).toFixed(1)}%`;
     const who = w.whale ? ` (top holder ${w.whale}${w.whaleIsContract ? ', a contract' : ''})` : '';
-    console.log(`        whale dump:     ${w.verdict}${rec}${who}`);
+    const pcs = w.dumpPieces > 1 ? `, sold in ${w.dumpPieces} pieces` : '';
+    console.log(`        whale dump:     ${w.verdict}${rec}${pcs}${who}`);
     if (w.verdict !== 'WHALE_DUMP_SURVIVED' && w.reason) console.log(`                        ${w.reason}`);
+    if (w.sellCapSuspected) console.log('                        one sale of the whole balance reverted but smaller sales went through: possibly a per-transaction sell limit');
+    if (w.balanceNote) console.log(`                        ${w.balanceNote}`);
   }
   (rug.notes || []).forEach((n) => console.log(`        note: ${n}`));
 }
@@ -782,6 +785,9 @@ async function screen(tokenAddr, { amountEth = 0.05, minLiqEth = 1, pool = null,
   console.log('Gate 6  rug check:');
   const rug = await d.rugCheck(p, ADDR, {
     provider: d.provider,
+    // 2026-10-24: the same block Gates 3 to 5b simulated on, so the sell legs
+    // (sized from Gate 3's buy) and the whale's balance match the pool state.
+    pinnedBlock: (rt1 && rt1.pinnedBlock != null) ? rt1.pinnedBlock : null,
     baseAmountWei: ethers.utils.parseEther(String(amountEth)),
     baselineTokenOutWei: ethers.BigNumber.from(rt1.tokensReceivedWei),
     // Sell as much of the position as Gate 5 managed to (normally 100%).

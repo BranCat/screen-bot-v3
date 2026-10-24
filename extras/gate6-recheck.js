@@ -185,6 +185,7 @@ async function recheck(s, { provider, http = null } = {}) {
     startSellBps: inp.startSellBps,
     controller: inp.controller,
     lookbackBlocks: lookback,
+    pinnedBlock: inp.block, // rug-check.js pins by itself since 24 Oct; the wrapper above stays for older copies
     http,
   };
   if (whale.error) {

@@ -670,6 +670,144 @@ section('8. 2026-10-10 fixes: contract owners, explorer route, baseline size');
   check('same pool but controller UNKNOWN -> UNPROVEN, never PASS', g2.decision === 'UNPROVEN' && /CONTRACT_OWNER/.test(g2.reason), `${g2.decision}: ${g2.reason}`);
 }
 
+
+// ==========================================================================
+section('9. 2026-10-24: pinned block, whale dump in pieces, real errors');
+// ==========================================================================
+{
+  // 8a. every bundle carries the pinned block; without a pin, none does
+  const seen = [];
+  SCRIPT = (steps) => {
+    seen.push(steps.map((st) => st.block_number));
+    const r = steps.map(() => ({ ...okStep }));
+    r[r.length - 1] = sellStep(0.049, steps[0].from);
+    return r;
+  };
+  const prov = { async getBlockNumber() { return 999999; }, async getLogs() { return []; }, async getCode() { return '0x'; }, async call() { throw new Error('unexpected call'); } };
+  const g = await rug.rugCheck(v4Pool, ADDR, { ...whaleOpts, baseAmountWei: ethers.utils.parseEther('0.05'), provider: prov, pinnedBlock: 4242 });
+  check('pinned: at least one bundle was sent', seen.length > 0);
+  check('pinned: every step of every bundle has block_number 4242', seen.length > 0 && seen.every((b) => b.every((n) => n === 4242)), JSON.stringify(seen.map((b) => b[0])));
+  check('pinned: the result records the block', g.probes && g.probes.pinnedBlock === 4242, JSON.stringify(g.probes && g.probes.pinnedBlock));
+  seen.length = 0;
+  const g2 = await rug.rugCheck(v4Pool, ADDR, { ...whaleOpts, baseAmountWei: ethers.utils.parseEther('0.05'), provider: prov });
+  check('unpinned: no step carries a block_number', seen.length > 0 && seen.every((b) => b.every((n) => n === undefined)));
+  check('unpinned: a note says so', (g2.notes || []).some((n) => /not pinned/.test(n)), JSON.stringify(g2.notes));
+}
+{
+  // 8b. the pinned provider reads "as of" the block, and falls back once when the RPC has no history
+  const tags = [];
+  const base = {
+    async call(tx, t) { tags.push(t); if (t === 77 && tags.length > 1) throw new Error('missing trie node abc'); return '0x01'; },
+    async getLogs(f) { return [f.toBlock]; },
+  };
+  const notes = [];
+  const pp = rug.pinnedProvider(base, 77, (m) => notes.push(m));
+  await pp.call({ to: TOKEN, data: '0x' });
+  check('pinned provider passes the block as the block tag', tags[0] === 77, JSON.stringify(tags));
+  check('getBlockNumber answers the pinned block', (await pp.getBlockNumber()) === 77);
+  check('getLogs never reads past the pinned block', (await pp.getLogs({ toBlock: 500 }))[0] === 77);
+  await pp.call({ to: TOKEN, data: '0x' });
+  check('no history -> falls back to latest and says so', tags[tags.length - 1] === 'latest' && notes.length === 1, JSON.stringify({ tags, notes }));
+}
+{
+  // 8c. the pieces add up to exactly the balance; approvals once
+  const bal = ethers.BigNumber.from('1000000000000000000000003');
+  const d = rug.whaleDumpSteps(V4_LEGS, OWNER, bal, 4);
+  check('4 pieces: approvals once, then 4 swaps', JSON.stringify(d.labels) === JSON.stringify(['approval 1', 'approval 2', 'swap 1/4', 'swap 2/4', 'swap 3/4', 'swap 4/4']), JSON.stringify(d.labels));
+  const ur = new ethers.utils.Interface(['function execute(bytes commands, bytes[] inputs, uint256 deadline) payable']);
+  const amounts = d.steps.slice(2).map((st) => {
+    const ex = ur.parseTransaction({ data: st.input });
+    const [, params] = ethers.utils.defaultAbiCoder.decode(['bytes', 'bytes[]'], ex.args.inputs[0]);
+    const sp = ethers.utils.defaultAbiCoder.decode(['tuple(tuple(address,address,uint24,int24,address),bool,uint128,uint128,uint256,bytes)'], params[0]);
+    return ethers.BigNumber.from(sp[0][2]);
+  });
+  const sum = amounts.reduce((a, b) => a.add(b), ethers.BigNumber.from(0));
+  check('the 4 swap amounts sum to the whole balance', sum.eq(bal), `${sum.toString()} vs ${bal.toString()}`);
+  const dc = rug.whaleDumpSteps(V4_LEGS, OWNER, bal, 1, true);
+  check('code cleared: every whale step overrides its code with 0x', dc.steps.every((st) => st.state_objects && Object.entries(st.state_objects).some(([a, o]) => a.toLowerCase() === OWNER.toLowerCase() && o.code === '0x')));
+  check('not cleared by default', rug.whaleDumpSteps(V4_LEGS, OWNER, bal, 1).steps.every((st) => !st.state_objects || !Object.values(st.state_objects).some((o) => o && o.code === '0x')));
+}
+{
+  // 8d. one sale of everything reverts (a sell cap); 4 pieces go through
+  const lens = [];
+  SCRIPT = (steps) => {
+    lens.push(steps.length);
+    const victim = steps[0].from;
+    const r = steps.map(() => ({ ...okStep }));
+    if (steps.length === 7) {
+      r[W_DUMP_IX] = { ...badStep('execution reverted'), raw: { transaction: { gas: 15000000, gas_used: 210000, transaction_info: { call_trace: {
+        to: ADDR.UNIVERSAL_ROUTER, error: 'execution reverted', output: '0x',
+        calls: [{ to: TOKEN, function_name: 'transferFrom', error: 'execution reverted', output: '0x08c379a0' + ethers.utils.defaultAbiCoder.encode(['string'], ['MaxTx']).slice(2) }],
+      } } } } };
+    }
+    r[steps.length - 1] = sellStep(0.048, victim);
+    return r;
+  };
+  const res = await rug.whaleDumpProbe(v4Pool, ADDR, whaleOpts, GOOD_BASELINE, V4_LEGS);
+  check('whole-balance sale reverts, 4 pieces succeed -> WHALE_DUMP_SURVIVED', res.verdict === 'WHALE_DUMP_SURVIVED', `${res.verdict}: ${res.reason}`);
+  check('two bundles: 1 piece (7 steps), then 4 pieces (10 steps)', JSON.stringify(lens) === '[7,10]', JSON.stringify(lens));
+  check('dumpPieces = 4 and sellCapSuspected', res.dumpPieces === 4 && res.sellCapSuspected === true);
+  check('the first attempt keeps the real error: the failing step', res.attempts[0].failedStep === 'swap 1/1', JSON.stringify(res.attempts[0]));
+  check('... the decoded revert reason of the deepest call', res.attempts[0].deepest && res.attempts[0].deepest.reason === 'Error("MaxTx")' && res.attempts[0].deepest.fn === 'transferFrom', JSON.stringify(res.attempts[0].deepest));
+  check('... and the gas used against the limit (not out of gas)', res.attempts[0].gasUsed === 210000 && res.attempts[0].gasLimit === 15000000 && res.attempts[0].outOfGas === false, JSON.stringify(res.attempts[0]));
+  check('the reason says how the whale sold', /in 4 sales/.test(res.reason), res.reason);
+}
+{
+  // 8e. an approval reverts for an EOA whale: no point in smaller pieces
+  const lens = [];
+  SCRIPT = (steps) => {
+    lens.push(steps.length);
+    const r = steps.map(() => ({ ...okStep }));
+    r[1] = badStep('sender not an eoa');
+    return r;
+  };
+  const res = await rug.whaleDumpProbe(v4Pool, ADDR, whaleOpts, GOOD_BASELINE, V4_LEGS);
+  check('approval fails -> UNPROVEN after one attempt', res.verdict === 'UNPROVEN' && lens.length === 1, `${res.verdict} ${JSON.stringify(lens)}`);
+  check('the failed step is named and the error kept', res.attempts[0].failedStep === 'approval 1' && /not an eoa/.test(res.attempts[0].error) && /approval 1 reverted/.test(res.reason), res.reason);
+}
+{
+  // 8f. the same for a contract whale: one more try as a plain wallet, and it is labelled
+  const runs = [];
+  SCRIPT = (steps) => {
+    const cleared = steps.some((st) => st.state_objects && Object.values(st.state_objects).some((o) => o && o.code === '0x'));
+    runs.push(cleared);
+    const r = steps.map(() => ({ ...okStep }));
+    if (!cleared) r[1] = badStep('sender not an eoa');
+    r[steps.length - 1] = sellStep(0.048, steps[0].from);
+    return r;
+  };
+  const res = await rug.whaleDumpProbe(v4Pool, ADDR, { ...whaleOpts }, GOOD_BASELINE, V4_LEGS);
+  check('(EOA whale from caller: not retried)', runs.length === 1, JSON.stringify(runs));
+  runs.length = 0;
+  // A contract whale comes from the explorer lookup; stub it.
+  const http = async () => ({ status: 200, json: { items: [{ address: { hash: OWNER, is_contract: true }, value: ethers.utils.parseEther('1000').toString() }] } });
+  const prov = { async call() { return ethers.utils.defaultAbiCoder.encode(['uint256'], [ethers.utils.parseEther('1000')]); } };
+  const res2 = await rug.whaleDumpProbe(v4Pool, ADDR, { ...baseOpts, http, provider: prov }, GOOD_BASELINE, V4_LEGS);
+  check('contract whale: retried with its code cleared, and that run decides', JSON.stringify(runs) === '[false,true]' && res2.verdict === 'WHALE_DUMP_SURVIVED', `${JSON.stringify(runs)} ${res2.verdict}: ${res2.reason}`);
+  check('the result says it was simulated as a plain wallet', res2.whaleCodeCleared === true && /plain wallet/.test(res2.reason), res2.reason);
+}
+{
+  // 8g. the explorer balance is replaced by the on-chain one
+  const http = async () => ({ status: 200, json: { items: [{ address: { hash: OWNER, is_contract: false }, value: ethers.utils.parseEther('1000').toString() }] } });
+  const prov = { async call() { return ethers.utils.defaultAbiCoder.encode(['uint256'], [ethers.utils.parseEther('600')]); } };
+  SCRIPT = (steps) => { const r = steps.map(() => ({ ...okStep })); r[steps.length - 1] = sellStep(0.048, steps[0].from); return r; };
+  const res = await rug.whaleDumpProbe(v4Pool, ADDR, { ...baseOpts, http, provider: prov }, GOOD_BASELINE, V4_LEGS);
+  check('on-chain balance is the one dumped', res.whaleBalanceWei === ethers.utils.parseEther('600').toString() && /on-chain one was used/.test(res.balanceNote || ''), `${res.whaleBalanceWei} ${res.balanceNote}`);
+  const prov0 = { async call() { return ethers.utils.defaultAbiCoder.encode(['uint256'], [0]); } };
+  const res0 = await rug.whaleDumpProbe(v4Pool, ADDR, { ...baseOpts, http, provider: prov0 }, GOOD_BASELINE, V4_LEGS);
+  check('zero on-chain balance -> NO_WHALE, nothing simulated as a dump', res0.verdict === 'NO_WHALE', res0.verdict);
+}
+{
+  // 8h. revert decoding
+  const enc = '0x08c379a0' + ethers.utils.defaultAbiCoder.encode(['string'], ['nope']).slice(2);
+  check('Error(string) decoded', rug.decodeRevert(enc) === 'Error("nope")', rug.decodeRevert(enc));
+  check('Panic decoded', rug.decodeRevert('0x4e487b71' + ethers.utils.defaultAbiCoder.encode(['uint256'], [0x11]).slice(2)) === 'Panic(0x11)');
+  check('custom error shows its selector', /custom error 0xdeadbeef/.test(rug.decodeRevert('0xdeadbeef')));
+  check('empty output -> null', rug.decodeRevert('0x') === null);
+  const oog = rug.stepDiagnosis({ ...badStep('out of gas'), raw: { transaction: { gas: 100, gas_used: 100 } } });
+  check('out of gas recognised', oog.outOfGas === true);
+}
+
 console.log(failures === 0 ? '\nall checks passed' : `\n${failures} check(s) FAILED`);
 process.exit(failures === 0 ? 0 : 1);
 }
