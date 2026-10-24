@@ -152,6 +152,11 @@ working from Frank's PC on 10 October with ERR_CONNECTION_RESET.
     6   rug check
                                  UNPROVEN / UNKNOWN is never a pass
 
+    change check (RECORD ONLY, 2026-10-24; runs after 1b, never decides)
+                                 can the token be changed after release: proxy + upgrader,
+                                 owner renounced?, role holders, owner-only switches in the
+                                 source, v4 hook. Saved as detail.changeCheck; see change-check.js
+
 Until 2026-10-08 Gates 3-5 never simulated anything on v4 pools: the bundle
 module needed pool reserves it was never given, returned "unsupported", and
 that read as "buy ok, sell ok". Fixed at both ends.

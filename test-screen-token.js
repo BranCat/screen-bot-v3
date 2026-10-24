@@ -47,9 +47,10 @@ function deps(over = {}) {
     transferAudit: rec('audit', async () => ({ ok: true, findings: [], ...FULL_AUDIT })),
     allowanceProbe: rec('allow', async () => ({ ...CLEAN_PROBE })),
     rugCheck: rec('rug', async () => ({ decision: 'PASS', reason: 'no rug vector', probes: {} })),
+    changeCheck: rec('change', async () => ({ checked: true, wouldBe: 'PASS', summary: 'no proxy, no owner, no switches found' })),
     provider: {},
   };
-  const NAMES = { sourceGate: 'source', discoverPool: 'pool', controllerCheck: 'controller', measureLiquidity: 'liq', walletRoundTrip: 'sim', transferAudit: 'audit', allowanceProbe: 'allow', rugCheck: 'rug' };
+  const NAMES = { sourceGate: 'source', discoverPool: 'pool', controllerCheck: 'controller', measureLiquidity: 'liq', walletRoundTrip: 'sim', transferAudit: 'audit', allowanceProbe: 'allow', rugCheck: 'rug', changeCheck: 'change' };
   for (const [k, fn] of Object.entries(over)) d[k] = rec(NAMES[k] || k, fn);
   return { d, calls };
 }
@@ -94,7 +95,7 @@ function deps(over = {}) {
     const { d, calls } = deps();
     const r = await quiet(() => screen(TOKEN, { deps: d }));
     assert.strictEqual(r.verdict, 'SNIP');
-    assert.deepStrictEqual(calls, ['source', 'pool', 'controller', 'liq', 'sim', 'sim', 'audit', 'allow', 'rug']);
+    assert.deepStrictEqual(calls, ['source', 'pool', 'controller', 'change', 'liq', 'sim', 'sim', 'audit', 'allow', 'rug']);
     assert.deepStrictEqual(r.flags, []);
     assert.strictEqual(r.controller.verdict, 'LOCKED');
   });
@@ -103,7 +104,7 @@ function deps(over = {}) {
     const { d, calls } = deps({ controllerCheck: async () => ({ verdict: 'UNKNOWN', reason: 'held by an unknown contract' }) });
     const r = await quiet(() => screen(TOKEN, { deps: d }));
     assert.strictEqual(r.verdict, 'SNIP');
-    assert.strictEqual(calls.length, 9); // + Gate 5b transfer audit + Gate 5c allowance probe
+    assert.strictEqual(calls.length, 10); // + Gate 5b transfer audit + Gate 5c allowance probe + the change check (record only)
     assert.strictEqual(r.flags.length, 1);
     assert.ok(/controller UNKNOWN/.test(r.flags[0]));
   });
@@ -402,6 +403,46 @@ function deps(over = {}) {
     assert.strictEqual(opts.pinnedBlock, 92348719);
     assert.strictEqual(r.audit.pinnedBlock, 92348719);
   });
+  // 2026-10-24: the change check is RECORD ONLY.
+  await check('change check: recorded in detail and on the verdict, after Gate 1b, before Gate 2', async () => {
+    const chg = { checked: true, wouldBe: 'PASS', summary: 'no proxy, no owner, no switches found', owner: { fn: null } };
+    const { d, calls } = deps({ changeCheck: async () => chg });
+    const r = await quiet(() => screen(TOKEN, { deps: d }));
+    assert.strictEqual(r.verdict, 'SNIP');
+    assert.strictEqual(r.detail.changeCheck, chg);
+    assert.deepStrictEqual(r.change, { wouldBe: 'PASS', summary: 'no proxy, no owner, no switches found' });
+    assert.ok(calls.indexOf('change') > calls.indexOf('controller') && calls.indexOf('change') < calls.indexOf('liq'), calls.join(','));
+  });
+  await check('change check says DO NOT SNIP -> the verdict is still SNIP (record only)', async () => {
+    const { d } = deps({ changeCheck: async () => ({ checked: true, wouldBe: 'DO NOT SNIP', summary: 'upgradeable proxy: 0xabcd…ef01 can replace the code' }) });
+    const r = await quiet(() => screen(TOKEN, { deps: d }));
+    assert.strictEqual(r.verdict, 'SNIP', r.reason);
+    assert.deepStrictEqual(r.flags, []);
+    assert.strictEqual(r.change.wouldBe, 'DO NOT SNIP');
+  });
+  await check('change check throws -> NOT CHECKED, the screen goes on to SNIP', async () => {
+    const { d, calls } = deps({ changeCheck: async () => { throw new Error('rpc down'); } });
+    const r = await quiet(() => screen(TOKEN, { deps: d }));
+    assert.strictEqual(r.verdict, 'SNIP', r.reason);
+    assert.strictEqual(r.detail.changeCheck.wouldBe, 'NOT CHECKED');
+    assert.ok(/rpc down/.test(r.change.summary));
+    assert.ok(calls.includes('rug'));
+  });
+  await check('change check is given the pool and the Gate 0 result', async () => {
+    let args = null;
+    const { d } = deps({ changeCheck: async (t, o) => { args = { t, o }; return { checked: true, wouldBe: 'PASS', summary: 'x' }; } });
+    await quiet(() => screen(TOKEN, { deps: d }));
+    assert.strictEqual(args.t, TOKEN);
+    assert.strictEqual(args.o.pool.version, 'v4');
+    assert.strictEqual(args.o.source.decision, 'PASS');
+  });
+  await check('a token stopped at Gate 1b is not change-checked', async () => {
+    const { d, calls } = deps({ controllerCheck: async () => ({ verdict: 'CREATOR_CAN_PULL', reason: 'EOA holds the LP', controller: '0xBAD' }) });
+    const r = await quiet(() => screen(TOKEN, { deps: d }));
+    assert.strictEqual(r.verdict, 'DO NOT SNIP');
+    assert.ok(!calls.includes('change'));
+    assert.strictEqual(r.change, null);
+  });
   // 2026-10-24: Gate 6 runs on the same block.
   await check('Gate 6 is given Gate 3\'s pinned block', async () => {
     let rugOpts = null;
@@ -691,7 +732,7 @@ function deps(over = {}) {
     assert.strictEqual(r.verdict, 'SNIP');
     assert.ok(r.flags.some((f) => /PonsV2LauncherToken/.test(f)));
     assert.strictEqual(r.detail.templateMatch.matched, true);
-    assert.deepStrictEqual(calls, ['source', 'pool', 'templateMatch', 'controller', 'liq', 'sim', 'sim', 'audit', 'allow', 'rug']);
+    assert.deepStrictEqual(calls, ['source', 'pool', 'templateMatch', 'controller', 'change', 'liq', 'sim', 'sim', 'audit', 'allow', 'rug']);
   });
   await check('probe: template match still stops at 1b when the creator can pull', async () => {
     const { d } = deps({ sourceGate: HIDDEN, templateMatch: async () => ({ matched: true, name: 'T', reason: 'x' }), controllerCheck: async () => ({ verdict: 'CREATOR_CAN_PULL', reason: 'eoa' }) });

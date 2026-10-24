@@ -71,6 +71,9 @@ function collect(o, nowMs = Date.now()) {
       pool: pool.poolId || r.poolId || pool.poolAddress || r.poolAddress || '',
       costPct: (d.roundTripJudgement && d.roundTripJudgement.costPct) ?? null,
       whaleRecovery: (r.rug && r.rug.whaleRecovery) ?? null,
+      // 2026-10-24: the change check (record only; see change-check.js)
+      changeCheck: d.changeCheck ? d.changeCheck.wouldBe || '' : '',
+      changeNotes: d.changeCheck ? d.changeCheck.summary || d.changeCheck.error || '' : '',
       tracked: s ? 'yes' : 'no',
       first: s && s.first ? s.first.v : null, firstMin: s && s.first ? s.first.min : null,
       r5m: cp('5m'), r30m: cp('30m'), r1h: cp('1h'), r6h: cp('6h'), r24h: cp('24h'), r3d: cp('3d'), r7d: cp('7d'),
@@ -88,7 +91,7 @@ const COLS = [['group', 'group'], ['time', 'time_local'], ['symbol', 'symbol'], 
   ['version', 'version'], ['launchPath', 'launch_path'], ['pool', 'pool'], ['costPct', 'round_trip_cost_pct'], ['whaleRecovery', 'whale_recovery'],
   ['tracked', 'live_tracked'], ['first', 'first_pct'], ['firstMin', 'first_after_min'], ['r5m', 'ret_5m'], ['r30m', 'ret_30m'], ['r1h', 'ret_1h'], ['r6h', 'ret_6h'],
   ['r24h', 'ret_24h'], ['r3d', 'ret_3d'], ['r7d', 'ret_7d'], ['latest', 'latest_pct'], ['latestMin', 'latest_after_min'], ['best', 'best_pct'], ['bestMin', 'best_after_min'],
-  ['worst', 'worst_pct'], ['file', 'screen_file']];
+  ['worst', 'worst_pct'], ['file', 'screen_file'], ['changeCheck', 'change_check'], ['changeNotes', 'change_notes']];
 
 function toCsv(rows) {
   const esc = (v) => { if (v == null) return ''; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };

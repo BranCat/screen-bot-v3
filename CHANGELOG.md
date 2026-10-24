@@ -3,6 +3,30 @@
 Each version that runs on the server gets a git tag. To go back to one:
 `git checkout <tag> -- <file>`, upload the file, restart the bot.
 
+## 2026-10-24-change-check
+
+New **change check, RECORD ONLY**: can the token be changed after release? It never changes a verdict;
+the three export groups stay as they are. Plan: collect about a week of findings, then decide whether
+to make it a hard rule (its own tagged version).
+
+- New change-check.js. For every token that reaches Gate 2 (i.e. could become a SNIP) it records:
+  proxy and who can upgrade it (EIP-1967 admin / ProxyAdmin owner, beacon owner, UUPS owner; minimal clones
+  are not upgradeable); owner() / getOwner() renounced or live, pendingOwner; AccessControl role holders
+  (RoleGranted events confirmed with hasRole); owner-, role- or special-address-only switches in the
+  published source (fees/tax, limits, blacklist, trading/pause, mint; selfdestruct/delegatecall noted);
+  the v4 hook (proxy? owner?). Template-matched tokens are scanned with the template's source.
+- `wouldBe` = what the planned rule would say: DO NOT SNIP / UNKNOWN / PASS (NOT CHECKED on an error).
+  The hook is reported only and does not affect it yet.
+- screen-token.js: runs it after Gate 1b, before Gate 2; result in the screen file (`detail.changeCheck`)
+  and on the verdict (`change`); one log line "Change check (record only, does not decide)". An error is
+  recorded as NOT CHECKED and the screen goes on.
+- extras/export-day.js: two new CSV columns at the end, `change_check` and `change_notes`. The on-screen
+  list is unchanged. Tokens screened before this version leave them blank.
+- CLI for a one-off look: `node change-check.js 0xTOKEN [--json]` (read-only).
+- Cost: one explorer source lookup per new bytecode (cached while the bot runs), a few RPC reads per token.
+- Files: change-check.js (new), test-change-check.js (new, 40 checks), screen-token.js, test-screen-token.js
+  (+5 checks), extras/export-day.js. No cron, package or .env changes.
+
 ## 2026-10-24-gate6-pin
 
 Gate 6 fix. Same checks and same verdict rules; the three export groups are unchanged.

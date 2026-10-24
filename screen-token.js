@@ -488,6 +488,8 @@ async function screen(tokenAddr, { amountEth = 0.05, minLiqEth = 1, pool = null,
     // lazy for the same reason: transfer-audit.js requires this file
     transferAudit: (...a) => require('./transfer-audit').transferAudit(...a),
     allowanceProbe: (...a) => require('./allowance-probe').allowanceProbe(...a),
+    // 2026-10-24: record only, never decides (see change-check.js)
+    changeCheck: (...a) => require('./change-check').changeCheck(...a),
     ...deps,
   };
   let controller = null;   // the Gate 1b result, carried on every verdict after it
@@ -496,7 +498,8 @@ async function screen(tokenAddr, { amountEth = 0.05, minLiqEth = 1, pool = null,
   // as r.detail. The summaries (audit, allowance, rug …) stay as they were;
   // watch-launches.js writes detail to screens/<date>/<token>.json for analysis.
   const detail = {};
-  const done = (kind, reason, extra = {}) => verdict(kind, reason, { ...extra, controller, flags, detail });
+  let change = null;       // 2026-10-24: the change check in brief (record only), carried on every verdict after it
+  const done = (kind, reason, extra = {}) => verdict(kind, reason, { ...extra, controller, change, flags, detail });
 
   console.log(`\nToken   ${tokenAddr}`);
   console.log(`Chain   ${CHAIN_ID} (Robinhood)\n`);
@@ -611,6 +614,22 @@ async function screen(tokenAddr, { amountEth = 0.05, minLiqEth = 1, pool = null,
     return done('UNKNOWN',
       'USDG pool — gates 0-1b ran, but the simulations (gates 2-6) do not cover USDG pools yet',
       { gate: 2 });
+  }
+
+  // ---- Change check (2026-10-24, RECORD ONLY) ------------------------------
+  // Can the token be changed after release: proxy, owner, roles, switches in
+  // the source, v4 hook. Runs for every token that reaches Gate 2, i.e. every
+  // token that could become a SNIP. It is written into the screen file and
+  // never changes the verdict: an error here is recorded and the screen goes on.
+  try {
+    const chg = await d.changeCheck(tokenAddr, { provider: d.provider, pool: p, source: src, template: detail.templateMatch || null });
+    detail.changeCheck = chg;
+    change = { wouldBe: chg.wouldBe, summary: chg.summary };
+    console.log(`Change check (record only, does not decide): ${chg.wouldBe} — ${chg.summary}`);
+  } catch (e) {
+    detail.changeCheck = { checked: false, wouldBe: 'NOT CHECKED', error: String(e.message || e).slice(0, 200) };
+    change = { wouldBe: 'NOT CHECKED', summary: detail.changeCheck.error };
+    console.log(`Change check (record only): not checked — ${detail.changeCheck.error}`);
   }
 
   // ---- Gate 2 -------------------------------------------------------------
