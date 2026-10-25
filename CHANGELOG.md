@@ -15,6 +15,10 @@ to make it a hard rule (its own tagged version).
   (RoleGranted events confirmed with hasRole); owner-, role- or special-address-only switches in the
   published source (fees/tax, limits, blacklist, trading/pause, mint; selfdestruct/delegatecall noted);
   the v4 hook (proxy? owner?). Template-matched tokens are scanned with the template's source.
+  Only the token's own contract and the contracts it inherits from are scanned (the explorer's contract
+  name): a verified Pons token can carry the whole launchpad's source (hook, factory, locker), whose
+  admin functions are not the token's. If the token's contract cannot be identified, the result is
+  UNKNOWN, never DO NOT SNIP.
 - `wouldBe` = what the planned rule would say: DO NOT SNIP / UNKNOWN / PASS (NOT CHECKED on an error).
   The hook is reported only and does not affect it yet.
 - screen-token.js: runs it after Gate 1b, before Gate 2; result in the screen file (`detail.changeCheck`)
@@ -22,9 +26,9 @@ to make it a hard rule (its own tagged version).
   recorded as NOT CHECKED and the screen goes on.
 - extras/export-day.js: two new CSV columns at the end, `change_check` and `change_notes`. The on-screen
   list is unchanged. Tokens screened before this version leave them blank.
-- CLI for a one-off look: `node change-check.js 0xTOKEN [--json]` (read-only).
+- CLI for a one-off look: `node change-check.js 0xTOKEN [--json]` (read-only; uses config.RPC_URL like the bot, never RPC_URL from .env).
 - Cost: one explorer source lookup per new bytecode (cached while the bot runs), a few RPC reads per token.
-- Files: change-check.js (new), test-change-check.js (new, 40 checks), screen-token.js, test-screen-token.js
+- Files: change-check.js (new), test-change-check.js (new, 50 checks), screen-token.js, test-screen-token.js
   (+5 checks), extras/export-day.js. No cron, package or .env changes.
 
 ## 2026-10-24-gate6-pin

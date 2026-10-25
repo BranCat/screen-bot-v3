@@ -259,9 +259,69 @@ const CATEGORIES = [
 ];
 const DANGEROUS = new Set(['mint', 'trading', 'blacklist', 'limits', 'fees']);
 
-function scanSwitches(source) {
-  const src = stripComments(source);
-  if (!src.trim()) return { scanned: false, found: [], notes: [] };
+// Every contract / abstract contract / library / interface block in the source:
+// name -> { kind, parents, text }. Solidity does not nest them.
+function contractsOf(src) {
+  const out = {};
+  const re = /\b(abstract\s+contract|contract|library|interface)\s+([A-Za-z_$][\w$]*)\s*(?:is\s+([^{]*))?\{/g;
+  let m;
+  while ((m = re.exec(src))) {
+    const open = m.index + m[0].length - 1;
+    const end = matchBrace(src, open);
+    if (end < 0) break;
+    const parents = [];
+    if (m[3]) {
+      let depth = 0; let cur = '';
+      for (const ch of m[3]) {
+        if (ch === '(') depth += 1;
+        else if (ch === ')') depth -= 1;
+        if (ch === ',' && depth === 0) { parents.push(cur); cur = ''; } else cur += ch;
+      }
+      parents.push(cur);
+    }
+    out[m[2]] = {
+      kind: m[1].replace(/\s+/g, ' '),
+      parents: parents.map((p) => (p.trim().match(/^[A-Za-z_$][\w$.]*/) || [''])[0].split('.').pop()).filter(Boolean),
+      text: src.slice(m.index, end + 1),
+    };
+    re.lastIndex = end + 1;
+  }
+  return out;
+}
+
+// The token's own contract and everything it inherits from. A verified source
+// often bundles other contracts (Pons tokens can carry the whole launchpad:
+// hook, factory, locker); their admin functions are not the token's.
+// `name` is the contract name the explorer reports. Without it, the one
+// concrete contract that nothing else inherits from is taken, if there is
+// exactly one. Returns { text, main, scoped }.
+function tokenScope(src, name) {
+  const all = contractsOf(src);
+  const concrete = Object.entries(all).filter(([, c]) => /contract/.test(c.kind));
+  let main = name && all[name] ? name : null;
+  if (!main) {
+    const inherited = new Set(concrete.flatMap(([, c]) => c.parents));
+    const leaves = concrete.filter(([n, c]) => c.kind === 'contract' && !inherited.has(n)).map(([n]) => n);
+    if (leaves.length === 1) [main] = leaves;
+  }
+  if (!main) return { text: src, main: null, scoped: concrete.length <= 1, contracts: concrete.length };
+  const seen = new Set();
+  const stack = [main];
+  while (stack.length) {
+    const n = stack.pop();
+    if (seen.has(n) || !all[n]) continue;
+    seen.add(n);
+    stack.push(...all[n].parents);
+  }
+  const text = [...seen].filter((n) => /contract/.test(all[n].kind)).map((n) => all[n].text).join('\n');
+  return { text, main, scoped: true, contracts: concrete.length, inherits: [...seen].filter((n) => n !== main) };
+}
+
+function scanSwitches(source, { contract = null } = {}) {
+  const full = stripComments(source);
+  if (!full.trim()) return { scanned: false, found: [], notes: [] };
+  const scope = tokenScope(full, contract);
+  const src = scope.text;
   const modifierBodies = {};
   const mre = /\bmodifier\s+(\w+)\s*(\([^)]*\))?[^{;]*\{/g;
   let m;
@@ -284,7 +344,11 @@ function scanSwitches(source) {
   const notes = [];
   if (/\bselfdestruct\s*\(/.test(src)) notes.push('selfdestruct in the source');
   if (/\.delegatecall\s*\(/.test(src)) notes.push('delegatecall in the source');
-  return { scanned: true, found: found.map(({ _text, ...x }) => x), notes };
+  if (!scope.scoped) notes.push(`could not tell which of the ${scope.contracts} contracts in the source is the token; all were scanned`);
+  return {
+    scanned: true, found: found.map(({ _text, ...x }) => x), notes,
+    contract: scope.main, scoped: scope.scoped, ...(scope.inherits ? { inherits: scope.inherits } : {}),
+  };
 }
 
 // ---------------------------------------------------------------- source fetch
@@ -300,7 +364,7 @@ async function defaultFetchSource(addr) {
   const parts = [json.source_code || ''];
   for (const s of json.additional_sources || []) parts.push(s.source_code || '');
   const source = parts.join('\n');
-  return source.trim() ? { source, error: null } : { source: null, error: 'no source in the explorer response' };
+  return source.trim() ? { source, name: json.name || null, error: null } : { source: null, error: 'no source in the explorer response' };
 }
 
 async function getSource(addr, fingerprint, fetchSource) {
@@ -308,7 +372,7 @@ async function getSource(addr, fingerprint, fetchSource) {
   for (const k of keys) if (sourceCache.has(k)) return { ...sourceCache.get(k), cached: true };
   let r;
   try { r = await fetchSource(addr); } catch (e) { r = { source: null, error: String(e.message || e).slice(0, 160) }; }
-  if (r.source) keys.forEach((k) => sourceCache.set(k, { source: r.source, error: null }));
+  if (r.source) keys.forEach((k) => sourceCache.set(k, { source: r.source, name: r.name || null, error: null }));
   return r;
 }
 
@@ -373,7 +437,9 @@ function judge(c) {
   const sw = c.switches || {};
   const dangerous = (sw.found || []).filter((f) => f.dangerous);
   const usable = dangerous.filter((f) => (f.guard === 'owner' && (ownerLive || !ow.fn)) || (f.guard === 'role' && (roleLive || rl.holders === null)) || f.guard === 'special');
-  if (usable.length) {
+  if (usable.length && sw.scoped === false) {
+    unk.push(`switches found, but the source holds several contracts and the token's could not be told apart: ${usable.slice(0, 3).map((f) => f.fn).join(', ')}`);
+  } else if (usable.length) {
     const cats = [...new Set(usable.map((f) => f.category))].join(', ');
     no.push(`switches a privileged caller can still use (${cats}): ${usable.slice(0, 4).map((f) => f.fn).join(', ')}${usable.length > 4 ? ', ...' : ''}`);
   } else if (dangerous.length) {
@@ -383,7 +449,10 @@ function judge(c) {
     if (ownerLive || roleLive || ow.fn == null) unk.push(`source not scanned (${sw.error || 'no source'})${ownerLive ? ' and the owner is live' : ''}`);
     else info.push(`source not scanned (${sw.error || 'no source'})`);
   }
-  for (const n of sw.notes || []) (px.isProxy ? info : unk).push(n);
+  for (const n of sw.notes || []) {
+    if (/could not tell which/.test(n)) continue; // handled above
+    (px.isProxy ? info : unk).push(n);
+  }
 
   const hk = c.hook;
   if (hk) {
@@ -420,11 +489,13 @@ async function changeCheck(tokenAddr, opts = {}) {
       const fp = proxy.isProxy ? null : src.codeSha256NoMeta;
       const s = await getSource(subject, fp, opts.fetchSource || defaultFetchSource);
       switches = s.source
-        ? { ...scanSwitches(s.source), subject, cached: Boolean(s.cached), ...(src.sourceVerified === true ? {} : { viaTemplate: tmpl.name }) }
+        ? { ...scanSwitches(s.source, { contract: s.name || (tmpl && src.sourceVerified !== true ? tmpl.name : null) || src.explorer_name || null }), subject, cached: Boolean(s.cached), ...(src.sourceVerified === true ? {} : { viaTemplate: tmpl.name }) }
         : { scanned: false, error: s.error, found: [], notes: [] };
       switches._source = s.source || null;
     } else {
-      switches = { scanned: false, error: 'source not published', found: [], notes: [] };
+      // Say what Gate 0 actually found, not only "not published".
+      const why = src.decision ? `Gate 0 ${src.decision}: ${String(src.reason || '').slice(0, 120)}` : 'no Gate 0 result';
+      switches = { scanned: false, error: src.sourceVerified === false ? `source not published (${why})` : why, found: [], notes: [] };
     }
     const roles = await rolesPart(prov, tokenAddr, { lookbackBlocks: opts.lookbackBlocks, source: switches._source });
     delete switches._source;
@@ -446,17 +517,19 @@ async function changeCheck(tokenAddr, opts = {}) {
   }
 }
 
-module.exports = { changeCheck, scanSwitches, functionsOf, judge, readOwner, proxyPart, rolesPart, hookPart, _sourceCache: sourceCache, SLOT_1967_ADMIN };
+module.exports = { changeCheck, scanSwitches, functionsOf, contractsOf, tokenScope, judge, readOwner, proxyPart, rolesPart, hookPart, _sourceCache: sourceCache, SLOT_1967_ADMIN };
 
 // CLI: node change-check.js 0xTOKEN [--json]   (looks up the token's pool and Gate 0 result first; read-only)
 if (require.main === module) {
   (async () => {
     const token = process.argv.find((a) => /^0x[0-9a-fA-F]{40}$/.test(a));
     if (!token) { console.log('usage: node change-check.js 0xTOKEN'); process.exit(1); }
-    require('dotenv').config();
-    const prov = new ethers.providers.JsonRpcProvider(process.env.RPC_URL || config.RPC_URL);
+    require('dotenv').config({ quiet: true });
+    // The same connection and Gate 0 call as the live bot (screen-token.js):
+    // config.RPC_URL, never RPC_URL from .env, which may point elsewhere.
+    const prov = new ethers.providers.JsonRpcProvider(config.RPC_URL);
     const { sourceGate } = require('./source-gate');
-    const src = await sourceGate(token, {});
+    const src = await sourceGate(token, { rpcUrl: config.RPC_URL, chain: config.CHAIN_ID });
     let pool = null;
     try { const st = require('./screen-token'); pool = await st.discoverPool(token, { allowUsdg: true, hints: st.poolHintsFromLaunches ? st.poolHintsFromLaunches(token) : [] }); } catch (_) { /* pool optional */ }
     let template = null;
@@ -472,6 +545,7 @@ if (require.main === module) {
       console.log(`  proxy:    ${r.proxy.isProxy ? `${r.proxy.via}${r.proxy.upgradeable === false ? ', not upgradeable' : `, upgrader ${r.proxy.upgrader || 'unknown'}${r.proxy.upgraderRenounced ? ' (renounced)' : ''}`}` : 'no'}`);
       console.log(`  owner:    ${r.owner.fn ? `${r.owner.address}${r.owner.renounced ? ' (renounced)' : ' (LIVE)'}` : 'no owner() function'}`);
       console.log(`  roles:    ${r.roles.accessControl ? `${r.roles.holders ? r.roles.holders.length : '?'} live holder(s)` : 'none'}`);
+      if (r.switches.scanned) console.log(`  scanned:  ${r.switches.contract ? `contract ${r.switches.contract}${r.switches.inherits && r.switches.inherits.length ? ` + ${r.switches.inherits.length} parent(s)` : ''}` : 'the whole source (token contract not identified)'}`);
       console.log(`  switches: ${r.switches.scanned ? (r.switches.found.length ? r.switches.found.map((f) => `${f.fn} (${f.category}, ${f.guard})`).join(', ') : 'none found') : `not scanned: ${r.switches.error}`}${r.switches.viaTemplate ? `  [source of the ${r.switches.viaTemplate} template]` : ''}`);
       if (r.hook) console.log(`  hook:     ${r.hook.name || r.hook.address}, ${r.hook.isProxy ? 'proxy' : 'not a proxy'}, owner ${r.hook.owner ? `${r.hook.owner}${r.hook.ownerRenounced ? ' (renounced)' : ' (live)'}` : 'none'}`);
     }

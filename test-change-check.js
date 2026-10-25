@@ -85,6 +85,11 @@ async function main() {
   }
   {
     cc._sourceCache.clear();
+    const r = await cc.changeCheck(TOKEN, { provider: fakeProvider(), source: { decision: 'SKIP', reason: 'no bytecode at this address (EOA or self-destructed)' } });
+    check('the reason names what Gate 0 actually said', /Gate 0 SKIP: no bytecode/.test(r.summary), r.summary);
+  }
+  {
+    cc._sourceCache.clear();
     const r = await cc.changeCheck(TOKEN, { provider: fakeProvider(), source: VERIFIED, fetchSource: async () => ({ source: null, error: 'HTTP 402' }) });
     check('source fetch fails -> UNKNOWN with the reason', r.wouldBe === 'UNKNOWN' && /HTTP 402/.test(r.summary), r.summary);
   }
@@ -204,6 +209,51 @@ async function main() {
   {
     const s = cc.scanSwitches('interface I { function setFee(uint256 f) external; }');
     check('interface declarations are not functions with a body', s.found.length === 0);
+  }
+
+  section('4b. only the token\'s own contract is scanned');
+  {
+    // KILTR, 24 Oct: the explorer returned the token bundled with the whole
+    // launchpad (hook, factory). Their admin functions are not the token's.
+    const BUNDLE = `
+      abstract contract Ownable { address private _owner; modifier onlyOwner() { require(msg.sender == _owner); _; } }
+      interface IHook { function setHookFeeBps(uint256 b) external; }
+      contract LaunchToken is ERC20 { constructor() ERC20("A", "A") { _mint(msg.sender, 1e27); } }
+      contract LaunchFactory is Ownable { uint256 fee; function setLaunchFee(uint256 f) external onlyOwner { fee = f; }
+        function deployLaunch() external onlyOwner { _mint(address(this), 1); } }
+      contract MemeHook is Ownable { uint256 bps; function setHookFeeBps(uint256 b) external onlyOwner { bps = b; } }`;
+    const scoped = cc.scanSwitches(BUNDLE, { contract: 'LaunchToken' });
+    check('with the token\'s name: only LaunchToken is scanned, nothing found', scoped.contract === 'LaunchToken' && scoped.found.length === 0 && scoped.scoped === true, JSON.stringify(scoped));
+    const blind = cc.scanSwitches(BUNDLE);
+    check('without a name and 3 candidate contracts: not scoped', blind.scoped === false && blind.found.length > 0, JSON.stringify(blind));
+    const j = cc.judge({ owner: { fn: null }, proxy: { isProxy: false }, roles: { accessControl: false, holders: [] }, switches: blind, hook: null });
+    check('... which makes it UNKNOWN, never DO NOT SNIP', j.wouldBe === 'UNKNOWN' && /could not be told apart/.test(j.summary), j.summary);
+
+    cc._sourceCache.clear();
+    const r = await cc.changeCheck(TOKEN, { provider: fakeProvider(), source: VERIFIED, fetchSource: async () => ({ source: BUNDLE, name: 'LaunchToken', error: null }) });
+    check('end to end: the explorer\'s contract name scopes the scan -> PASS', r.wouldBe === 'PASS' && r.switches.contract === 'LaunchToken', r.summary);
+
+    cc._sourceCache.clear();
+    const r2 = await cc.changeCheck(TOKEN, { provider: fakeProvider(), source: { ...VERIFIED, explorer_name: 'LaunchToken' }, fetchSource: async () => ({ source: BUNDLE, error: null }) });
+    check('... or Gate 0\'s explorer name when the fetch gives none', r2.wouldBe === 'PASS' && r2.switches.contract === 'LaunchToken', r2.summary);
+  }
+  {
+    // A switch in a contract the token inherits from does count.
+    const SRC = `
+      abstract contract Ownable { address private _owner; modifier onlyOwner() { require(msg.sender == _owner); _; } }
+      abstract contract Taxed is Ownable { uint256 public tax; function setTax(uint256 t) external onlyOwner { tax = t; } }
+      contract Other is Ownable { function setFee(uint256 f) external onlyOwner {} }
+      contract Token is ERC20("T", "T"), Taxed { }`;
+    const s1 = cc.scanSwitches(SRC, { contract: 'Token' });
+    check('a switch inherited from a parent contract is found', s1.found.map((f) => f.fn).join() === 'setTax' && s1.inherits.includes('Taxed') && s1.inherits.includes('Ownable'), JSON.stringify(s1));
+    check('constructor arguments in the "is" list are handled', s1.contract === 'Token');
+    const s2 = cc.scanSwitches(SRC);
+    check('without a name, "the contract nobody inherits from" is ambiguous here (Token, Other)', s2.scoped === false);
+  }
+  {
+    const moo = fs.readFileSync(path.join(__dirname, 'fixtures', 'moo-daeng.sol'), 'utf8');
+    const s = cc.scanSwitches(moo);
+    check('Moo Daeng without a name: the single most-derived contract is found', s.scoped === true && s.contract && s.found.length === 3, JSON.stringify({ c: s.contract, n: s.found.length }));
   }
 
   section('5. template tokens and the source cache');
