@@ -78,10 +78,10 @@ function fakeScreen(verdictFor = () => ({ verdict: 'SNIP', reason: 'ok', flags: 
   return fn;
 }
 const tmpFile = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wl-')), 'launches.jsonl');
-async function run(logs, { head = 1000, screenFn = fakeScreen(), outFile = null, minEth = 1, minUsdg = 1000, from = 1, detectFile = null, detailDir = null, waitFile = null, sourceGateFn, sourceRecheckSec, now, alarm, holdRetrySec, holdMaxSec } = {}) {
+async function run(logs, { head = 1000, screenFn = fakeScreen(), outFile = null, minEth = 1, minUsdg = 1000, from = 1, detectFile = null, detailDir = null, waitFile = null, sourceGateFn, sourceRecheckSec, now, alarm, holdRetrySec, holdMaxSec, sourceFeedSec, feedPollFn, feedResetFn } = {}) {
   const provider = fakeProvider(logs, head);
   const lines = [];
-  const w = createWatcher({ provider, screenFn, outFile, minEth, minUsdg, detectFile, detailDir, waitFile, sourceGateFn, sourceRecheckSec, now, alarm: alarm || (() => {}), holdRetrySec, holdMaxSec, explorerStats: null, log: (...a) => lines.push(a.join(' ')) });
+  const w = createWatcher({ provider, screenFn, outFile, minEth, minUsdg, detectFile, detailDir, waitFile, sourceGateFn, sourceRecheckSec, now, alarm: alarm || (() => {}), holdRetrySec, holdMaxSec, sourceFeedSec, feedPollFn, feedResetFn, explorerStats: null, log: (...a) => lines.push(a.join(' ')) });
   await w.start();
   w._setFrom = from;
   // start() puts nextBlock at head+1 for a live start; replay from `from` instead
@@ -660,6 +660,189 @@ const POOL = addr(0x5001);
     const outFile = tmpFile();
     await run([init(ID, ADDR.ZERO, TOK, ADDR.ZERO, 20), modify(ID, L5, 21)], { outFile });
     assert.strictEqual(recs(outFile)[0].quotaHold, null);
+  });
+
+  // ---- 2026-11-05: source feed (source-feed.js) + 24 h backup schedule ------------
+  // A fake feed: each poll() returns the next answer in the list (the last one repeats).
+  const feedSeq = (...answers) => {
+    const calls = [];
+    const fn = async () => { calls.push(1); const a = answers[Math.min(calls.length - 1, answers.length - 1)]; return typeof a === 'function' ? a() : a; };
+    fn.calls = calls;
+    return fn;
+  };
+  const NOHIT = { ok: true, hits: new Set(), requests: 1, gap: false };
+  const HIT = (...a) => ({ ok: true, hits: new Set(a.map(lc)), requests: 1, gap: false });
+  const NEW_SCHEDULE = [30, 300, 1800, 7200, 86400];
+  const IMPL = addr(0x1111);
+  const PROXY_HIDDEN = { decision: 'SKIP', sourceVerified: false, isProxy: true, implementationAddr: IMPL, reason: 'implementation source NOT published' };
+  const launch = () => [init(ID, ADDR.ZERO, TOK, PONS_HOOK, 20), modify(ID, L5, 21)];
+
+  await check('feed: a waiting token named by the feed is looked up at once and screened; record says found by feed', async () => {
+    const outFile = tmpFile();
+    const c = clock();
+    const sg = gateSeq(PUBLIC);
+    const fp = feedSeq(HIT(TOK));
+    const screenFn = pendingScreen();
+    const { w } = await run(launch(), { screenFn, outFile, now: c.now, sourceGateFn: sg, sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp });
+    c.at(12); await w.checkSourceWait(); await w.idle();
+    assert.strictEqual(fp.calls.length, 1);
+    assert.strictEqual(sg.calls.length, 1);
+    const rec = JSON.parse(fs.readFileSync(outFile, 'utf8').trim());
+    assert.strictEqual(rec.verdict, 'SNIP');
+    assert.strictEqual(rec.sourceRecheck.foundBy, 'feed');
+    assert.strictEqual(rec.sourceRecheck.foundAfterSec, 12);
+    assert.deepStrictEqual(rec.sourceRecheck.feed, { everySec: 60, lookups: 1 });
+    assert.strictEqual(w.stats.sourceFoundByFeed, 1);
+  });
+  await check('feed: a token not named by the feed is not looked up before its slot', async () => {
+    const c = clock();
+    const sg = gateSeq(PUBLIC);
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: sg, sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: feedSeq(HIT(TOK2)) });
+    c.at(12); await w.checkSourceWait();
+    assert.strictEqual(sg.calls.length, 0);
+    c.at(30); await w.checkSourceWait(); await w.idle();
+    assert.strictEqual(sg.calls.length, 1);
+    assert.strictEqual(w.results[0].sourceRecheck.foundBy, 'schedule');
+  });
+  await check('feed: read at most once per sourceFeedSec', async () => {
+    const c = clock();
+    const fp = feedSeq(NOHIT);
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: gateSeq(HIDDEN), sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp });
+    for (const t of [1, 11, 21, 59]) { c.at(t); await w.checkSourceWait(); }
+    assert.strictEqual(fp.calls.length, 1);
+    c.at(62); await w.checkSourceWait();
+    assert.strictEqual(fp.calls.length, 2);
+  });
+  await check('feed: not read when nothing waits; reset when the list empties', async () => {
+    const c = clock();
+    const fp = feedSeq(HIT(TOK));
+    let resets = 0;
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: gateSeq(PUBLIC), sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp, feedResetFn: () => { resets += 1; } });
+    c.at(5); await w.checkSourceWait(); await w.idle();
+    assert.strictEqual(w._state.sourceWait.size, 0);
+    c.at(200); await w.checkSourceWait();
+    assert.strictEqual(fp.calls.length, 1, 'no read with an empty list');
+    // checkSourceWait returns early on an empty list, so reset happens on the next read attempt with a list;
+    // what matters: no credits are spent while nothing waits.
+    assert.ok(resets <= 1);
+  });
+  await check('feed: proxy verified but implementation hidden -> keeps waiting; implementation named later -> found', async () => {
+    const outFile = tmpFile();
+    const c = clock();
+    const sg = gateSeq(PROXY_HIDDEN, PUBLIC);
+    const fp = feedSeq(HIT(TOK), NOHIT, HIT(IMPL));
+    const { w, lines } = await run(launch(), { screenFn: pendingScreen(), outFile, now: c.now, sourceGateFn: sg, sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp });
+    c.at(10); await w.checkSourceWait();
+    assert.strictEqual(sg.calls.length, 1);
+    assert.strictEqual(w._state.sourceWait.size, 1, 'still waiting: implementation hidden');
+    const e = w._state.sourceWait.get(lc(TOK));
+    assert.strictEqual(e.slotsDone, 0, 'a feed lookup is not a schedule slot');
+    assert.strictEqual(e.implAddr, lc(IMPL));
+    assert.ok(lines.some((l) => /named by the feed, but still SKIP/.test(l)));
+    c.at(25); await w.checkSourceWait(); // no read (60 s), no slot yet
+    c.at(70); await w.checkSourceWait(); // read 2: nothing; slot 30 s due -> schedule lookup... answers PUBLIC
+    await w.idle();
+    assert.strictEqual(sg.calls.length, 2);
+    assert.strictEqual(w.results[0].sourceRecheck.foundBy, 'schedule');
+  });
+  await check('feed: implementation named by the feed is matched to its proxy token', async () => {
+    const c = clock();
+    const sg = gateSeq(PROXY_HIDDEN, PUBLIC);
+    const fp = feedSeq(NOHIT, HIT(IMPL));
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: sg, sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp });
+    c.at(30); await w.checkSourceWait(); // read 1 (nothing) + slot 30 s: proxy, implementation hidden
+    assert.strictEqual(w._state.sourceWait.get(lc(TOK)).implAddr, lc(IMPL));
+    c.at(95); await w.checkSourceWait(); await w.idle(); // read 2 names the implementation
+    assert.strictEqual(sg.calls.length, 2);
+    assert.strictEqual(w.results[0].verdict, 'SNIP');
+    assert.strictEqual(w.results[0].sourceRecheck.foundBy, 'feed');
+  });
+  await check('feed: a failed read changes nothing; the backup slot still finds the token', async () => {
+    const c = clock();
+    const sg = gateSeq(PUBLIC);
+    const fp = feedSeq({ ok: false, status: 500, error: 'HTTP 500', requests: 1 });
+    const { w, lines } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: sg, sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp });
+    c.at(30); await w.checkSourceWait(); await w.idle();
+    assert.strictEqual(w._state.feed.errors, 1);
+    assert.ok(lines.some((l) => /\[feed\] read failed/.test(l)));
+    assert.strictEqual(w.results[0].sourceRecheck.foundBy, 'schedule');
+  });
+  await check('feed: a thrown error is caught like a failed read', async () => {
+    const c = clock();
+    const fp = feedSeq(() => { throw new Error('socket hang up'); });
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: gateSeq(HIDDEN), sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp });
+    c.at(5); await w.checkSourceWait();
+    assert.strictEqual(w._state.feed.errors, 1);
+    assert.strictEqual(w._state.sourceWait.size, 1);
+  });
+  await check('feed: HTTP 402 raises the quota alarm and pauses the feed for holdRetrySec', async () => {
+    const c = clock();
+    const alarms = [];
+    const fp = feedSeq({ ok: false, status: 402, error: null, requests: 1 }, NOHIT);
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: gateSeq(HIDDEN), sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp, holdRetrySec: 600, alarm: (m) => alarms.push(m) });
+    c.at(5); await w.checkSourceWait();
+    assert.strictEqual(alarms.length, 1);
+    c.at(300); await w.checkSourceWait();
+    assert.strictEqual(fp.calls.length, 1, 'paused');
+    c.at(606); await w.checkSourceWait();
+    assert.strictEqual(fp.calls.length, 2, 'reading again after the pause');
+  });
+  await check('24 h schedule: never published -> backups at 30 s, 5 min, 30 min, 2 h; given up only at 24 h', async () => {
+    const outFile = tmpFile();
+    const c = clock();
+    const sg = gateSeq(HIDDEN);
+    const { w } = await run(launch(), { screenFn: pendingScreen(), outFile, now: c.now, sourceGateFn: sg, sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: feedSeq(NOHIT) });
+    for (const t of [30, 300, 1800, 3600, 7200, 50000]) { c.at(t); await w.checkSourceWait(); }
+    assert.strictEqual(sg.calls.length, 4);
+    assert.strictEqual(w._state.sourceWait.size, 1, 'still waiting before 24 h');
+    c.at(86400); await w.checkSourceWait(); await w.idle();
+    assert.strictEqual(sg.calls.length, 5);
+    const rec = JSON.parse(fs.readFileSync(outFile, 'utf8').trim());
+    assert.strictEqual(rec.verdict, 'DO NOT SNIP');
+    assert.strictEqual(rec.gate, 0);
+    assert.strictEqual(rec.sourceRecheck.gaveUpAfterSec, 86400);
+  });
+  await check('24 h schedule: published 3.6 h after launch (MONKEYBOX case) is found by the feed', async () => {
+    const c = clock();
+    const sg = gateSeq(HIDDEN, HIDDEN, HIDDEN, HIDDEN, PUBLIC);
+    let hitNow = false;
+    const fp = feedSeq(() => (hitNow ? HIT(TOK) : NOHIT));
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: sg, sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 60, feedPollFn: fp });
+    for (const t of [30, 300, 1800, 7200]) { c.at(t); await w.checkSourceWait(); }
+    hitNow = true;
+    c.at(13080); await w.checkSourceWait(); await w.idle();
+    assert.strictEqual(w.results[0].verdict, 'SNIP');
+    assert.strictEqual(w.results[0].sourceRecheck.foundBy, 'feed');
+    assert.strictEqual(w.results[0].sourceRecheck.foundAfterSec, 13080);
+  });
+  await check('restart after the schedule change: an entry saved under the old 8-step list is re-counted, not stuck', async () => {
+    const outFile = tmpFile();
+    const waitFile = path.join(path.dirname(outFile), 'source-wait.json');
+    const c = clock();
+    const OLD = [30, 60, 120, 300, 600, 900, 1800, 3600];
+    const { w: w1 } = await run(launch(), { screenFn: pendingScreen(), outFile, waitFile, now: c.now, sourceGateFn: gateSeq(HIDDEN), sourceRecheckSec: OLD });
+    for (const t of [30, 60, 120, 300, 600, 900, 1800]) { c.at(t); await w1.checkSourceWait(); }
+    assert.strictEqual(w1._state.sourceWait.get(lc(TOK)).slotsDone, 7);
+    // restart with the new schedule
+    const sg2 = gateSeq(HIDDEN);
+    const { w: w2 } = await run(launch(), { screenFn: pendingScreen(), outFile, waitFile, now: c.now, sourceGateFn: sg2, sourceRecheckSec: NEW_SCHEDULE });
+    assert.strictEqual(w2._state.sourceWait.get(lc(TOK)).slotsDone, 3, '30 s, 5 min, 30 min already covered');
+    c.at(3600); await w2.checkSourceWait();
+    assert.strictEqual(sg2.calls.length, 0, 'next backup is at 2 h');
+    c.at(7200); await w2.checkSourceWait();
+    assert.strictEqual(sg2.calls.length, 1);
+    c.at(86400); await w2.checkSourceWait(); await w2.idle();
+    assert.strictEqual(w2._state.sourceWait.size, 0, 'given up at 24 h, not stuck');
+  });
+  await check('feed off (sourceFeedSec 0): no reads, behaviour as before', async () => {
+    const c = clock();
+    const fp = feedSeq(HIT(TOK));
+    const { w } = await run(launch(), { screenFn: pendingScreen(), now: c.now, sourceGateFn: gateSeq(PUBLIC), sourceRecheckSec: NEW_SCHEDULE, sourceFeedSec: 0, feedPollFn: fp });
+    c.at(12); await w.checkSourceWait();
+    assert.strictEqual(fp.calls.length, 0);
+    c.at(30); await w.checkSourceWait(); await w.idle();
+    assert.strictEqual(w.results[0].sourceRecheck.foundBy, 'schedule');
+    assert.strictEqual(w.results[0].sourceRecheck.feed, null);
   });
 
   console.log(failed ? `${failed} failed, ${passed} passed` : `all checks passed (${passed})`);

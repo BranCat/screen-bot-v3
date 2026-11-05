@@ -10,7 +10,10 @@ WorkingDirectory=/home/botuser/bot-v3
 # --since 15m: after any restart, re-scan the last 15 minutes so a launch
 # during the restart is not missed. Tokens already in launches.jsonl are
 # never screened twice.
-ExecStart=/usr/bin/node /home/botuser/bot-v3/watch-launches.js --since 15m
+# --source-recheck / --source-feed (2026-11-05-source-feed): a hidden-source token is looked up
+# when the explorer's newly-verified list names it (read every 60 s), with backup lookups at
+# 30 s, 5 min, 30 min, 2 h, and given up at 24 h.
+ExecStart=/usr/bin/node /home/botuser/bot-v3/watch-launches.js --since 15m --source-recheck 30,300,1800,7200,86400 --source-feed 60
 Restart=always
 RestartSec=10
 # The watcher writes its own full log to /home/botuser/bot-v3/logs/ (one file

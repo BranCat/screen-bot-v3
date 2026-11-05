@@ -17,9 +17,17 @@
 //                      complete result: screens/<date>/<time>_<SYMBOL>_<token>.json
 //   --log FILE         where a full copy of everything printed goes
 //                      (default logs/watch-YYYY-MM-DD_HHMM.txt, one file per run)
-//   --source-recheck 30,60,120,300   seconds after launch at which a token whose
-//                      source was not published yet is looked up again (default)
+//   --source-recheck 30,300,1800,7200,86400   seconds after launch at which a token
+//                      whose source was not published yet is looked up again; after the
+//                      last one it is given up (DO NOT SNIP, gate 0). Default since
+//                      2026-11-05: 30 s, 5 min, 30 min, 2 h, 24 h (backup checks; the
+//                      feed below does the fast work). Before: 30,60,120,300,600,900,1800,3600.
 //   --no-source-recheck   old behaviour: an unpublished source is final at Gate 0
+//   --source-feed 60   seconds between reads of the explorer's "recently verified
+//                      contracts" list (source-feed.js), 2026-11-05. A waiting token
+//                      named there is looked up at once instead of at its next slot.
+//                      Read only while tokens are waiting. 0 = off.
+//   --no-source-feed   same as --source-feed 0
 //   --wait-file source-wait.json   the re-check list, kept on disk so a restart
 //                      does not forget it
 //   --hold-retry 600   explorer quota outage (HTTP 402): seconds between probe
@@ -61,6 +69,9 @@
 //     SNIP at once. Otherwise the token goes on the source re-check list and is
 //     looked up again 30s / 1m / 2m / 5m after launch; published -> full screen,
 //     still hidden after the last look -> DO NOT SNIP (gate 0) as before.
+//     2026-11-05: plus the source feed (source-feed.js): the explorer's newly-verified
+//     list is read every 60 s and a waiting token named there is looked up at once;
+//     backup lookups 30 s / 5 min / 30 min / 2 h, given up at 24 h.
 //   - Pons and Bags launches are named from their hook (pool-resolve.js).
 
 require('dotenv').config();
@@ -191,6 +202,19 @@ function createWatcher(opts) {
   const recheckDelays = (opts.sourceRecheckSec === undefined ? [30, 60, 120, 300] : (opts.sourceRecheckSec || []))
     .map(Number).filter((x) => Number.isFinite(x) && x >= 0).sort((a, b) => a - b);
   const recheckOn = recheckDelays.length > 0;
+  // 2026-11-05: source feed (source-feed.js). opts.sourceFeedSec: seconds between reads,
+  // 0/undefined = off. opts.feedPollFn / opts.feedResetFn replace the real feed in tests.
+  const feedSec = recheckOn ? Number(opts.sourceFeedSec || 0) : 0;
+  const feedOn = feedSec > 0;
+  let feedPoll = opts.feedPollFn || null;
+  let feedReset = opts.feedResetFn || (() => {});
+  if (feedOn && !feedPoll) {
+    const sf = require('./source-feed');
+    const f = sf.makeFeed({ get: sf.explorerGetter(), maxPages: opts.feedMaxPages ?? 6 });
+    feedPoll = f.poll;
+    feedReset = f.reset;
+  }
+  const feed = { lastRead: null, reads: 0, requests: 0, errors: 0, errorsInRow: 0, gaps: 0, hits: 0, pauseUntil: 0, active: false };
   const waitFile = opts.waitFile ?? null;
   const now = opts.now || (() => Date.now());
   const sourceGateFn = opts.sourceGateFn || ((token) => require('./source-gate').sourceGate(token, { rpcUrl: RPC_URL, chain: 4663 }));
@@ -222,7 +246,7 @@ function createWatcher(opts) {
   const results = [];
   let working = false;
   let idleResolvers = [];
-  const stats = { detected: 0, screened: 0, byVerdict: {}, sourceWaiting: 0, sourceFound: 0, sourceGaveUp: 0, quotaHeld: 0, quotaReleased: 0, quotaExpired: 0 };
+  const stats = { detected: 0, screened: 0, byVerdict: {}, sourceWaiting: 0, sourceFound: 0, sourceFoundByFeed: 0, sourceGaveUp: 0, quotaHeld: 0, quotaReleased: 0, quotaExpired: 0 };
   const sourceWait = new Map();      // token (lc) -> waiting entry, see waitForSource()
 
   // Earlier records: never re-screen a token, and remember who controlled what.
@@ -248,6 +272,14 @@ function createWatcher(opts) {
         const k = lc(e.item.p.tokenAddr);
         if (seenTokens.has(k)) continue; // already has a final record
         seenTokens.add(k);
+        // 2026-11-05: the schedule may have changed since this entry was saved (old
+        // 8-step list -> new 5-step list). Count the slots of the CURRENT schedule that
+        // its last lookup already covered, so it neither skips a backup check nor
+        // waits forever.
+        if (!e.hold) {
+          const last = e.lastCheck && Number.isFinite(e.lastCheck.afterSec) ? e.lastCheck.afterSec : null;
+          e.slotsDone = last == null ? 0 : recheckDelays.filter((d) => d <= last).length;
+        }
         sourceWait.set(k, e);
       }
     } catch (_) { /* a damaged file is ignored, not fatal */ }
@@ -553,7 +585,8 @@ function createWatcher(opts) {
   // Explorer requests per hour, from source-gate.js's counter.
   let lastReport = null;
   let lastCalls = null;
-  const callSnap = () => ({ calls: explorerStats.calls, byStatus: { ...explorerStats.byStatus } });
+  const callSnap = () => ({ calls: explorerStats.calls, byStatus: { ...explorerStats.byStatus },
+    feedReads: feed.reads, feedRequests: feed.requests, feedErrors: feed.errors, feedHits: feed.hits });
   function reportExplorer() {
     if (!explorerStats) return;
     const t = now();
@@ -562,9 +595,59 @@ function createWatcher(opts) {
     const cur = callSnap();
     const parts = Object.entries(cur.byStatus).map(([st, n]) => [st, n - (lastCalls.byStatus[st] || 0)]).filter(([, n]) => n > 0)
       .map(([st, n]) => `HTTP ${st}: ${n}`);
-    log(`[explorer] last ${hrs(t - lastReport)}: ${cur.calls - lastCalls.calls} requests (${parts.join(', ') || 'none'}); ${heldCount()} held${outage.since ? '; QUOTA OUTAGE' : ''}`);
+    const fd = feedOn ? `; feed ${feed.reads - (lastCalls.feedReads || 0)} reads, ${feed.requests - (lastCalls.feedRequests || 0)} requests, ${feed.errors - (lastCalls.feedErrors || 0)} failed, ${feed.hits - (lastCalls.feedHits || 0)} hits` : '';
+    log(`[explorer] last ${hrs(t - lastReport)}: ${cur.calls - lastCalls.calls} requests (${parts.join(', ') || 'none'}); ${heldCount()} held${fd}; ${sourceWait.size} waiting for source${outage.since ? '; QUOTA OUTAGE' : ''}`);
     lastReport = t;
     lastCalls = cur;
+  }
+
+  // ---- source feed (2026-11-05) ----------------------------------------------
+  // Every feedSec, while tokens are waiting (and not held), read the explorer's list of
+  // newly verified contracts. A waiting token named there (its own address, or the
+  // implementation of a proxy token) is marked; checkSourceWait() then looks it up at
+  // once with the full source gate. The feed never decides anything by itself.
+  // A failed read is logged and retried next time; the backup slots keep working.
+  // HTTP 402 (credits used up) goes to the quota alarm and pauses the feed.
+  async function readFeed() {
+    if (!feedOn) return;
+    const waiting = [...sourceWait.values()].filter((e) => !e.hold);
+    if (!waiting.length) {
+      if (feed.active) { feedReset(); feed.active = false; }
+      return;
+    }
+    const t = now();
+    if (t < feed.pauseUntil) return;
+    if (feed.lastRead != null && (t - feed.lastRead) / 1000 < feedSec) return;
+    feed.lastRead = t;
+    feed.reads += 1;
+    let r;
+    try { r = await feedPoll(); } catch (err) { r = { ok: false, error: err.message, requests: 0 }; }
+    feed.requests += r.requests || 0;
+    if (!r.ok) {
+      feed.errors += 1;
+      feed.errorsInRow += 1;
+      if (r.status === 402 || isQuota(r.error)) {
+        quotaHit('source feed');
+        feed.pauseUntil = t + holdRetrySec * 1000;
+        log(`[feed] HTTP 402 (explorer credits used up): feed paused ${Math.round(holdRetrySec / 60)} min; backup checks continue`);
+      } else if (feed.errorsInRow === 1 || feed.errorsInRow % 10 === 0) {
+        log(`[feed] read failed (${feed.errorsInRow} in a row): ${String(r.error).slice(0, 200)}; backup checks continue`);
+      }
+      return;
+    }
+    if (feed.errorsInRow) log(`[feed] reading again after ${feed.errorsInRow} failed read(s)`);
+    feed.errorsInRow = 0;
+    feed.active = true;
+    if (r.gap) { feed.gaps += 1; log('[feed] GAP: the newest pages did not reach the last read; some verifications may be missed (backup checks cover them)'); }
+    if (!r.hits || !r.hits.size) return;
+    for (const e of waiting) {
+      const tok = lc(e.item.p.tokenAddr);
+      if (r.hits.has(tok) || (e.implAddr && r.hits.has(e.implAddr))) {
+        if (e.feedHitAt == null) feed.hits += 1;
+        e.feedHitAt = t;
+        log(`[feed] ${e.symbol || ''} ${e.item.p.tokenAddr}: ${r.hits.has(tok) ? 'token' : 'implementation'} just verified on the explorer — looking it up now`);
+      }
+    }
   }
 
   let checkingWait = false;
@@ -573,16 +656,21 @@ function createWatcher(opts) {
     checkingWait = true;
     try {
       await checkHeld();
+      await readFeed();
       for (const [k, e] of [...sourceWait]) {
         if (e.hold) continue;
         const base = e.item.detectedMs != null ? e.item.detectedMs : now();
         const elapsedSec = (now() - base) / 1000;
         let reached = 0;
         while (reached < recheckDelays.length && elapsedSec >= recheckDelays[reached]) reached += 1;
-        if (reached <= e.slotsDone) continue;
+        const bySlot = reached > e.slotsDone;
+        const byFeed = e.feedHitAt != null;
+        if (!bySlot && !byFeed) continue;
         // Slots missed while the bot was down are skipped, not replayed: one lookup now.
-        e.slotsDone = reached;
+        if (bySlot) e.slotsDone = reached;
+        e.feedHitAt = null;
         e.lookups += 1;
+        if (byFeed) e.feedLookups = (e.feedLookups || 0) + 1;
         let src;
         try { src = await sourceGateFn(e.item.p.tokenAddr); } catch (err) { src = { decision: 'ERROR', reason: err.message }; }
         if (src.decision === 'ERROR' && isQuota(src.reason)) {
@@ -591,23 +679,27 @@ function createWatcher(opts) {
           continue;
         }
         if (viaExplorer(src)) quotaOk();
-        e.lastCheck = { at: albertaISOString(), afterSec: Math.round(elapsedSec), decision: src.decision, reason: src.reason };
+        // A proxy: remember its implementation, so the feed can name that address too.
+        if (src.implementationAddr) e.implAddr = lc(src.implementationAddr);
+        e.lastCheck = { at: albertaISOString(), afterSec: Math.round(elapsedSec), decision: src.decision, reason: src.reason, by: byFeed ? 'feed' : 'schedule' };
         const info = {
           hiddenAtLaunch: true,
           controllerAtLaunch: e.controllerAtLaunch ? e.controllerAtLaunch.verdict : null,
           schedule: recheckDelays, checks: e.lookups,
+          feed: feedOn ? { everySec: feedSec, lookups: e.feedLookups || 0 } : null,
         };
         const tok = e.item.p.tokenAddr;
         if (src.decision === 'PASS') {
           sourceWait.delete(k);
           stats.sourceFound += 1;
-          const found = { ...info, foundOnCheck: e.lookups, foundAfterSec: Math.round(elapsedSec), verifiedBy: src.verifiedBy || null, explorerName: src.explorer_name || null };
-          log(`\n*** SOURCE NOW PUBLISHED ${e.symbol || ''} ${tok} — ${found.foundAfterSec}s after launch (check ${e.lookups}) — screening`);
+          if (byFeed) stats.sourceFoundByFeed += 1;
+          const found = { ...info, foundOnCheck: e.lookups, foundAfterSec: Math.round(elapsedSec), foundBy: byFeed ? 'feed' : 'schedule', verifiedBy: src.verifiedBy || null, explorerName: src.explorer_name || null };
+          log(`\n*** SOURCE NOW PUBLISHED ${e.symbol || ''} ${tok} — ${found.foundAfterSec}s after launch (check ${e.lookups}, found by ${found.foundBy}) — screening`);
           note({ event: 'source_found', block: e.item.launchBlock, logIndex: 'source_found', token: tok, pool: poolKeyOf(e.item.p),
-            afterSec: found.foundAfterSec, check: e.lookups, verifiedBy: found.verifiedBy, explorerName: found.explorerName });
+            afterSec: found.foundAfterSec, check: e.lookups, foundBy: found.foundBy, verifiedBy: found.verifiedBy, explorerName: found.explorerName });
           queue.push({ ...e.item, symbol: e.symbol, recheck: found });
           kick();
-        } else if (e.slotsDone >= recheckDelays.length) {
+        } else if (bySlot && e.slotsDone >= recheckDelays.length) {
           sourceWait.delete(k);
           stats.sourceGaveUp += 1;
           const gave = { ...info, foundOnCheck: null, gaveUpAfterSec: Math.round(elapsedSec), lastDecision: src.decision };
@@ -624,7 +716,7 @@ function createWatcher(opts) {
           log(`\n--- source re-check gave up: ${e.symbol || ''} ${tok} ---`);
           finish({ ...e.item, recheck: gave }, e.symbol, r, now());
         } else {
-          vlog(`[source-wait] ${e.symbol || ''} ${tok}: still ${src.decision} at +${Math.round(elapsedSec)}s`);
+          (byFeed ? log : vlog)(`[source-wait] ${e.symbol || ''} ${tok}: ${byFeed ? 'named by the feed, but ' : ''}still ${src.decision} at +${Math.round(elapsedSec)}s${byFeed ? ` — ${src.reason}` : ''}`);
         }
       }
     } finally {
@@ -794,7 +886,7 @@ function createWatcher(opts) {
 
   return {
     start, pollOnce, idle, scanRange, checkSourceWait, reportExplorer, results, stats,
-    _state: { pendingV3, pendingV4, seenTokens, queue, controllerCount, sourceWait, outage },
+    _state: { pendingV3, pendingV4, seenTokens, queue, controllerCount, sourceWait, outage, feed },
   };
 }
 
@@ -811,7 +903,8 @@ if (require.main === module) {
   const detailDir = path.resolve(__dirname, flag('--screens', 'screens'));
   const waitFile = path.resolve(__dirname, flag('--wait-file', 'source-wait.json'));
   const sourceRecheckSec = args.includes('--no-source-recheck')
-    ? [] : String(flag('--source-recheck', '30,60,120,300')).split(',').map(Number).filter((x) => Number.isFinite(x) && x >= 0);
+    ? [] : String(flag('--source-recheck', '30,300,1800,7200,86400')).split(',').map(Number).filter((x) => Number.isFinite(x) && x >= 0);
+  const sourceFeedSec = args.includes('--no-source-feed') ? 0 : Math.max(0, Number(flag('--source-feed', 60)) || 0);
 
   // Everything printed to the terminal — including every gate line from
   // screen-token.js — is also written to a text file, so long runs survive
@@ -840,6 +933,7 @@ if (require.main === module) {
     detailDir,
     waitFile,
     sourceRecheckSec,
+    sourceFeedSec,
     holdRetrySec: Number(flag('--hold-retry', 600)),
     holdMaxSec: Number(flag('--hold-max', 3600)),
     verbose: process.env.VERBOSE === '1',
@@ -848,7 +942,8 @@ if (require.main === module) {
   const summary = () => {
     const v = Object.entries(w.stats.byVerdict).map(([k, n]) => `${k} ${n}`).join(', ') || 'none';
     console.log(`\nDetected ${w.stats.detected}, screened ${w.stats.screened} (${v}). Records: ${outFile}`);
-    console.log(`Source re-check: ${w.stats.sourceWaiting} put on the list, ${w.stats.sourceFound} published later, ${w.stats.sourceGaveUp} never published, ${w._state.sourceWait.size} still waiting (${waitFile})`);
+    console.log(`Source re-check: ${w.stats.sourceWaiting} put on the list, ${w.stats.sourceFound} published later (${w.stats.sourceFoundByFeed} found by the feed), ${w.stats.sourceGaveUp} never published, ${w._state.sourceWait.size} still waiting (${waitFile})`);
+    console.log(`Source feed: ${sourceFeedSec && sourceRecheckSec.length ? `${w._state.feed.reads} reads, ${w._state.feed.requests} requests, ${w._state.feed.errors} failed, ${w._state.feed.hits} hits` : 'off'}`);
     console.log(`Explorer quota guard: ${w.stats.quotaHeld} held, ${w.stats.quotaReleased} released and screened, ${w.stats.quotaExpired} written off`);
     console.log(`Full log: ${logFile}`);
   };
@@ -864,6 +959,7 @@ if (require.main === module) {
     console.log(sourceRecheckSec.length
       ? `Hidden source: Gate 1b first, then re-check at ${sourceRecheckSec.map((x) => `+${x}s`).join(', ')} (${w._state.sourceWait.size} on the list from before)`
       : 'Hidden source: final at Gate 0 (--no-source-recheck)');
+    if (sourceRecheckSec.length) console.log(sourceFeedSec ? `Source feed: the explorer's newly verified list is read every ${sourceFeedSec}s while tokens wait` : 'Source feed: off');
 
     let failures = 0;
     for (;;) {

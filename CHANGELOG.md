@@ -3,6 +3,44 @@
 Each version that runs on the server gets a git tag. To go back to one:
 `git checkout <tag> -- <file>`, upload the file, restart the bot.
 
+## 2026-11-05-source-feed
+
+**Source feed**: a token that launches with its source hidden is now noticed within about a minute of the
+source being published, and is watched for 24 hours instead of 1. Same gates and verdict rules.
+
+Why: 1 in 3 SNIPs launch before their source is published. They were found only at the next re-check
+(median 16 min after launch, up to 30 min late), and anything published after 1 h was given up for good.
+The 24 h shadow test (extras/feed-shadow.js, 3-4 Nov) read the explorer's "recently verified contracts" list
+every 60 s: 1,440 reads, all HTTP 200, no gaps, new verifications seen a median 31 s after verified_at. It
+saw the 3 late tokens the bot found 1-17 min sooner, and 5 tokens the bot had given up on; one of those,
+MONKEYBOX, screens SNIP today.
+
+- New source-feed.js: reads Blockscout API v2 /smart-contracts (newest first) through source-gate.js's route,
+  pages back to the last entry seen, returns the addresses just verified (a proxy entry also names its
+  implementations). It never decides anything.
+- watch-launches.js:
+  - `--source-feed 60` (default; `0` or `--no-source-feed` = off): while tokens wait for their source, the
+    list is read every 60 s. A waiting token named there (its own address, or the implementation of a proxy
+    token) is looked up at once with the full source gate. A proxy whose implementation is still hidden keeps
+    waiting (the PONS case). No reads while nothing waits.
+  - New default schedule `--source-recheck 30,300,1800,7200,86400`: backup lookups at 30 s, 5 min, 30 min,
+    2 h, then given up at 24 h (was 30,60,120,300,600,900,1800,3600 on the server). A feed lookup is not a
+    schedule slot.
+  - A failed feed read is logged ("[feed] read failed", first and every 10th) and changes nothing; the backups
+    keep working. HTTP 402 goes to the existing quota alarm and pauses the feed for --hold-retry seconds.
+  - Records: `sourceRecheck.foundBy` = "feed" or "schedule", `sourceRecheck.feed` = { everySec, lookups };
+    detections.jsonl source_found carries foundBy. Hourly "[explorer]" line adds feed reads, requests,
+    failures, hits and the number waiting. Summary on exit adds "found by the feed".
+  - source-wait.json from the old version is re-counted against the new schedule on load (from each entry's
+    last lookup time), so no entry is stuck or skips a backup.
+- Cost: about 1,440 feed requests a day while anything waits (counted in the [explorer] line); lookups per
+  waiting token about the same as before. The key's daily credit limit is to be confirmed at dev.blockscout.com.
+- Watch for: screens of late tokens happen hours after launch, on the token's state at that time (a pool
+  drained meanwhile fails Gate 1b). Price tracking starts at that screen.
+- Files: source-feed.js (new), test-source-feed.js (new, 9 checks), watch-launches.js, test-watch-launches.js
+  (+13 checks, 63 in all), token-screener-v3.service (adds --source-recheck and --source-feed). Old copies kept as
+  watch-launches.before-sourcefeed.js, test-watch-launches.before-sourcefeed.js. No package, .env or cron changes.
+
 ## 2026-10-24-change-check
 
 New **change check, RECORD ONLY**: can the token be changed after release? It never changes a verdict;
