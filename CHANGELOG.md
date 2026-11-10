@@ -3,6 +3,45 @@
 Each version that runs on the server gets a git tag. To go back to one:
 `git checkout <tag> -- <file>`, upload the file, restart the bot.
 
+## 2026-11-10-ready-times (extras only; the bot is unchanged)
+
+**Ready-time recorder** beside the bot: for every token that passed Gates 0-5 (SNIP, or rejected at Gate 6),
+when could it first be traded, and how long after that did the bot mark it? Read-only; the bot still runs
+2026-11-05-source-feed.
+
+Result (330 tokens, 15 Oct - 10 Nov): the bot marks a token about 1 minute after it becomes tradable, in both
+launch situations. SNIPs: code first (68) median 66 s; trades first (32) median 74 s. Most of that minute is the
+screening itself (Gate 1b scan ~17 s, simulations ~40 s).
+
+- "Tradable" = the later of the pool going live (the bot's launch block: liquidity reached the bot's minimum)
+  and the source being published. Two cases: code first (source before the pool) and trades first (pool
+  before the source; found by the source feed).
+- New extras/ready-times.js (cron every 15 min, `--live`): one row per token in extras/ready/ready-times.csv
+  (launch, code published, tradable, bot marked, bot_lag_s, case, verdict). `--show DATE` prints a readable
+  list in Edmonton time.
+- New extras/verify-ready.js (cron daily 02:37 UTC, `--days 2`): checks each recorded time against the chain
+  (pool created, first liquidity, pool live, first trade, first trade after the code). AGREES / CHECK /
+  INCOMPLETE. Every run is merged into extras/ready/verify-all.csv, the record of first liquidity and first
+  trade. First runs: 20 sampled tokens (8 Nov) and the 9 tokens of 9-10 Nov all agree.
+- 10 Nov fix, **the explorer's verified_at can be early**: for some tokens it is minutes before the source can
+  really be read (LGND: the bot's 30-min check, 9 min after verified_at, was told "not published"; AGENTDOM:
+  stamped 7 min before its pool existed, found 16 min after). The code time is now held against the bot's own
+  checks stored in each screen file (last "not published" check, or the feed's previous read; the check that
+  found it). The explorer time is used if it lies in that window; if earlier, the last "not published" check is
+  used (never flatters the bot); if later (Sourcify, twin match), the bot's time. Rebuilt all rows: 51
+  trades-first rows corrected, 27 of them by more than 2 min (up to 30 min); trades-first median lag 207 s ->
+  74 s; code first unchanged. Consequence: for trades-first tokens the code time is a consistency check, not
+  an independent one (pool and trade times are read from the chain).
+- verify-ready.js also: dates in the table; a trade before the launch block is flagged only if the code was
+  already published then (the LIT case; not BPCATE); liquidity alone before the launch block is a note (the
+  29 Oct "p" spam tokens).
+- Files: extras/ready-times.js, extras/test-ready-times.js (40 checks), extras/verify-ready.js,
+  extras/test-verify-ready.js (26 checks), extras/README.md. Cron (botuser): ready-times every 15 min,
+  verify-ready daily. No change to the bot, its service, package.json or .env.
+- Known limits: for trades-first tokens the code moment is known only to within the feed interval (60 s);
+  before 5 Nov (no feed) the window is wider. Explorer cost: one request per new token, plus one per token in
+  the daily check.
+
 ## 2026-11-05-source-feed
 
 **Source feed**: a token that launches with its source hidden is now noticed within about a minute of the

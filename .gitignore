@@ -11,8 +11,10 @@ logs/
 *.log
 extras/live/
 extras/exports/
+extras/ready/
 tenderly-last-response.json
 
 # Old hand-made backups: git keeps the history now
 *.before-*.js
 *.before-*.sh
+*.before-*.md

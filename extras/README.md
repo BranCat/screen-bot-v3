@@ -93,3 +93,50 @@ Reading the numbers:
 - "WOULD SNIP" means the second opinion passed Gate 6 on the screen's block.
   "PASS, LIQUIDITY CONTROL UNKNOWN" is a pass on a pool whose liquidity
   controller is not LOCKED (every v3 pool today), and is never a SNIP.
+
+## ready-times.js (added 2026-11-09)
+
+Read-only. For every SNIP and every Gate 6 rejection (passed Gates 0-5), records the
+moment the token could first be traded: the later of the launch block and the time its
+source was published (explorer verified_at). Next to it, when the bot actually marked it,
+and the gap (bot_lag_s). Labels each token "code first" or "trades first".
+
+    node extras/ready-times.js            backfill, all dates (one explorer request per token)
+    node extras/ready-times.js --live     new screens only (cron, every 15 min)
+
+Output: extras/ready/ready-times.jsonl and .csv. Tests: node extras/test-ready-times.js
+
+    node extras/ready-times.js --show 2026-11-09   readable list from that date, Edmonton time
+
+2026-11-10: the explorer's verified_at can be earlier than the moment the source could
+really be read (LGND, AGENTDOM: the bot asked after that time and got "not published").
+The code time is now checked against the bot's own checks in the screen file:
+code_absent_utc (last "not published" check, or the feed's previous read when the feed
+found it) and code_seen_utc (the check that found it). The explorer time is used if it
+lies between the two; if earlier, code_absent_utc is used and explorer_early_s says by
+how much; if later (Sourcify, twin), code_seen_utc. code_explorer_utc keeps the
+explorer's own value. Rows already recorded are not recalculated: after installing
+this version, rebuild once into a side file (--out extras/ready/ready-times-new),
+compare, then move it over ready-times.jsonl/.csv.
+
+## verify-ready.js (added 2026-11-09, updated 2026-11-10)
+
+Read-only check of ready-times.js against the chain: pool created, first liquidity,
+pool live (launch block), first trade, first trade after the code. The code time is the
+explorer's (asked again) held against the bot's checks, like ready-times.js, so for
+trades-first tokens it is a consistency check, not an independent one.
+
+    node extras/verify-ready.js --sample 20          20 random tokens
+    node extras/verify-ready.js --since 2026-11-09   every token from that date
+    node extras/verify-ready.js --days 2             the last 2 days (daily cron)
+
+Results: AGREES / CHECK / INCOMPLETE. An early explorer time is AGREES with a note. A
+trade before the launch block is CHECK only if the code was already published then
+(LIT); liquidity before the launch block is a note. Output: extras/ready/verify.csv
+(this run) and extras/ready/verify-all.csv / .jsonl (every token ever checked, newest
+check kept: the record of first liquidity and first trade).
+Tests: node extras/test-verify-ready.js
+
+Daily cron (botuser), 02:37 UTC:
+
+    37 2 * * * cd /home/botuser/bot-v3 && /usr/bin/node extras/verify-ready.js --days 2 >> extras/ready/verify.log 2>&1
