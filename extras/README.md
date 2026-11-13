@@ -74,6 +74,14 @@ Daily list of one day's tokens, SNIPs first, with the tracker's prices:
 
     sudo -u botuser node extras/export-day.js --date 2026-10-22     # default: yesterday, Calgary time
 
+Since 13 Nov each line also shows when the token became tradable, when the bot
+marked it and the lag between them, taken as is from the recorder
+(`extras/ready/ready-times.jsonl`, see ready-times.js below; SNIPs and Gate 6
+tokens only). `*` = trades first (timed by the source code), `pending` = the
+recorder has not reached it yet, `-` = not recorded. The CSV gains
+`tradable_local`, `marked_local`, `bot_lag_s`, `case`, `tradable_utc`,
+`code_from`, `code_seen_utc` and `ready_time` after `gate`.
+
 
 Outputs:
 
@@ -140,3 +148,33 @@ Tests: node extras/test-verify-ready.js
 Daily cron (botuser), 02:37 UTC:
 
     37 2 * * * cd /home/botuser/bot-v3 && /usr/bin/node extras/verify-ready.js --days 2 >> extras/ready/verify.log 2>&1
+
+## fast-screen.js (added 2026-11-11) — shadow, read-only
+
+Runs the bot's own `screen()` again on every new token, beside the bot, to see whether the
+same verdict can be reached in ~10-15 s instead of ~1 min. It never edits a bot file and
+never changes a verdict the bot writes. Two changes, both about *when* work is done:
+
+1. **Log scans start at the pool's creation block.** Gate 1b and the Gate 6 census ask for
+   the pool's events over 200,000 blocks (~17 s). A pool has no events before it exists, so
+   requests that end before the creation block are answered "none" without the RPC.
+2. **Sim #2, 5b, 5c and 6 start together as soon as sim #1 returns.** screen() still asks
+   for them in the original order and gets the early result only if its inputs match
+   field by field; otherwise the check runs normally. The first failing gate still decides.
+
+Known difference: sim #2 and 5c pick their own block when they start, so started early they
+can see a block a few seconds earlier than the bot's. Each record keeps those blocks.
+
+Cost: Tenderly simulations roughly double (agreed 11 Nov). One token at a time; at most 4
+extra Tenderly calls at once. Explorer: 1-2 extra requests per token.
+
+    cd /home/botuser/bot-v3
+    sudo -u botuser mkdir -p extras/fast
+    sudo -u botuser nohup node extras/fast-screen.js > extras/fast/run.out 2>&1 &
+    pkill -f extras/fast-screen.js                     # stop (stops by itself after 120 h)
+    sudo -u botuser node extras/fast-screen.js --compare [--since 2026-11-11]
+
+Output in `extras/fast/`: `fast-screen.jsonl` (one line per screen: verdict, gate, seconds,
+per-check timings, early-start hits/misses/wasted, log requests skipped, pinned blocks),
+`screens/<date>/*.txt` (full gate output), `fast-screen.log`, `compare.csv`.
+Tests: `node extras/test-fast-screen.js` (29 checks, offline).

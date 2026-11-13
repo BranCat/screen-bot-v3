@@ -18,3 +18,4 @@ tenderly-last-response.json
 *.before-*.js
 *.before-*.sh
 *.before-*.md
+extras/fast/
